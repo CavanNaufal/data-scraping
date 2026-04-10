@@ -2,8 +2,9 @@ name: Scraping Siranap Otomatis
 
 on:
   schedule:
-    - cron: '0 0 * * *' # Berjalan otomatis tiap jam 07:00 WIB pagi
-  workflow_dispatch: # Mengizinkan tombol "Run" manual
+    # 01 = 08:00 WIB, 05 = 12:00 WIB, 10 = 17:00 WIB
+    - cron: '0 1,5,10 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: write
