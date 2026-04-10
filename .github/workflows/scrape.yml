@@ -1,0 +1,42 @@
+name: Scraping Siranap Otomatis
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Berjalan otomatis tiap jam 07:00 WIB pagi
+  workflow_dispatch: # Mengizinkan tombol "Run" manual
+
+permissions:
+  contents: write
+
+jobs:
+  jalankan-scraper:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tarik Kode dari Repo
+        uses: actions/checkout@v3
+
+      - name: Siapkan Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Google Chrome (Untuk Selenium)
+        run: |
+          wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          sudo sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list'
+          sudo apt-get update
+          sudo apt-get install google-chrome-stable
+
+      - name: Install Library Python
+        run: pip install -r requirements.txt
+
+      - name: Eksekusi Scraping
+        run: python scraper.py
+
+      - name: Simpan CSV ke GitHub
+        run: |
+          git config --global user.name "GitHub Action Bot"
+          git config --global user.email "action@github.com"
+          git add data_siranap.csv
+          git commit -m "Update otomatis data SIRANAP" || echo "Data tidak ada perubahan"
+          git push
