@@ -21,7 +21,7 @@ def run_fast_scraper():
     driver = webdriver.Chrome(options=chrome_options)
     all_data = []
     
-    # KODE PROVINSI RESMI BPS (38 Provinsi)
+    # Official Indonesian Province Codes (38 Provinces)
     province_codes = [
         11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 
         31, 32, 33, 34, 35, 36, 
@@ -33,7 +33,6 @@ def run_fast_scraper():
     ]
     
     try:
-        # Pemanasan browser untuk Cloudflare
         print("Warming up the browser to bypass Cloudflare...")
         driver.get('https://keslan.kemkes.go.id/app/siranap/')
         time.sleep(10)
@@ -91,11 +90,9 @@ def run_fast_scraper():
         df = pd.DataFrame(all_data)
         df['Available Beds'] = pd.to_numeric(df['Available Beds'])
         
-        # Output dikembalikan menjadi format CSV
         file_name = 'siranap_data.csv'
         df.to_csv(file_name, index=False)
-        
-        print(f"SUCCESS! {len(df)} rows of data saved to CSV.")
+        print(f"SUCCESS! {len(df)} rows saved to CSV.")
     else:
         print("FAILED: No data was extracted.")
 
