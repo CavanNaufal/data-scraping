@@ -1,43 +1,52 @@
-name: Scraping Siranap Otomatis
+name: Automated Siranap Scraper
 
 on:
   schedule:
-    - cron: '0 7,14 * * *'
+    - cron: '0 7,12,17 * * *'
       timezone: Asia/Jakarta
   workflow_dispatch:
 
 permissions:
   contents: write
 
+# Konfigurasi ini akan menghilangkan peringatan Node.js 20
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
-  jalankan-scraper:
+  run-scraper:
     runs-on: ubuntu-latest
     steps:
-      - name: Tarik Kode dari Repo
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Siapkan Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Install Google Chrome (Untuk Selenium)
+      - name: Install Google Chrome
         run: |
           wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
           sudo sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list'
           sudo apt-get update
           sudo apt-get install google-chrome-stable
 
-      - name: Install Library Python
+      - name: Install Python Dependencies
         run: pip install -r requirements.txt
 
-      - name: Eksekusi Scraping
-        run: python scraper.py
+      - name: Execute Scraper
+        run: |
+          # Menghapus paksa semua jejak ChromeDriver versi lama di server GitHub
+          sudo rm -f /usr/bin/chromedriver
+          sudo rm -f /usr/local/bin/chromedriver
+          sudo rm -f /usr/local/share/chrome_driver/chromedriver
+          python scraper.py
 
-      - name: Simpan CSV ke GitHub
+      - name: Save CSV to GitHub
         run: |
           git config --global user.name "GitHub Action Bot"
           git config --global user.email "action@github.com"
-          git add data_siranap.csv
-          git commit -m "Update otomatis data SIRANAP" || echo "Data tidak ada perubahan"
+          git add siranap_data.csv
+          git commit -m "Auto-update SIRANAP data (CSV)" || echo "No data changes"
           git push
