@@ -8,83 +8,96 @@ from bs4 import BeautifulSoup
 import pandas as pd
 import time
 import re
-import os
 
-def jalankan_scraper():
-    print("Menyiapkan browser headless di server GitHub...")
+def run_fast_scraper():
+    print("Setting up headless browser...")
     chrome_options = Options()
     chrome_options.add_argument('--headless=new')
     chrome_options.add_argument('--no-sandbox')
     chrome_options.add_argument('--disable-dev-shm-usage')
     chrome_options.add_argument('--disable-gpu')
-    # Menyamar sebagai manusia agar Cloudflare lebih ramah
     chrome_options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
     
     driver = webdriver.Chrome(options=chrome_options)
-    semua_data = []
+    all_data = []
+    
+    # KODE PROVINSI RESMI BPS (38 Provinsi)
+    province_codes = [
+        11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 
+        31, 32, 33, 34, 35, 36, 
+        51, 52, 53, 
+        61, 62, 63, 64, 65, 
+        71, 72, 73, 74, 75, 76, 
+        81, 82, 
+        91, 92, 93, 94, 95, 96, 97
+    ]
     
     try:
-        for i in range(1, 101):
-            kode_prop = f"{i}prop"
-            url = f'https://keslan.kemkes.go.id/app/siranap/rumah_sakit?jenis=2&propinsi={kode_prop}&kabkota='
-            print(f"Mengecek provinsi: {kode_prop}...")
+        # Pemanasan browser untuk Cloudflare
+        print("Warming up the browser to bypass Cloudflare...")
+        driver.get('https://keslan.kemkes.go.id/app/siranap/')
+        time.sleep(10)
+        print("Warm-up complete. Starting fast data extraction...")
+
+        for i in province_codes:
+            prop_code = f"{i}prop"
+            url = f'https://keslan.kemkes.go.id/app/siranap/rumah_sakit?jenis=2&propinsi={prop_code}&kabkota='
+            print(f"Checking province code: {prop_code}...")
             
             driver.get(url)
             
             try:
-                # Menunggu 10 detik, memberi waktu Cloudflare loading jika ada
-                WebDriverWait(driver, 10).until(
+                WebDriverWait(driver, 3).until(
                     EC.presence_of_element_located((By.CLASS_NAME, "cardRS"))
                 )
-                time.sleep(2)
                 
                 soup = BeautifulSoup(driver.page_source, 'html.parser')
                 
-                # Ekstrak Nama Provinsi
-                nama_propinsi = f"Kode {kode_prop}"
-                opsi_prop = soup.find('option', value=kode_prop)
-                if opsi_prop:
-                    nama_propinsi = opsi_prop.text.strip()
+                province_name = f"Code {prop_code}"
+                prop_option = soup.find('option', value=prop_code)
+                if prop_option:
+                    province_name = prop_option.text.strip()
                 
                 cards = soup.find_all('div', class_='cardRS')
                 
                 for card in cards:
-                    nama_rs = card.find('h5').text.strip() if card.find('h5') else "-"
-                    tabel = card.find('table')
+                    hospital_name = card.find('h5').text.strip() if card.find('h5') else "-"
+                    table = card.find('table')
                     
-                    if tabel:
-                        for tr in tabel.find_all('tr'):
-                            kolom = tr.find_all('td')
-                            if len(kolom) == 4:
-                                # Ekstrak hanya angka untuk ketersediaan bed
-                                teks_ketersediaan = kolom[2].text.strip()
-                                match_angka = re.search(r'\d+', teks_ketersediaan)
-                                angka_saja = match_angka.group() if match_angka else "0"
+                    if table:
+                        for tr in table.find_all('tr'):
+                            columns = tr.find_all('td')
+                            if len(columns) == 4:
+                                availability_text = columns[2].text.strip()
+                                number_match = re.search(r'\d+', availability_text)
+                                just_number = number_match.group() if number_match else "0"
                                 
-                                semua_data.append({
-                                    'Provinsi': nama_propinsi,
-                                    'Nama RS': nama_rs,
-                                    'Kelas': kolom[0].text.strip(),
-                                    'Ruangan': kolom[1].text.strip(),
-                                    'Tersedia': angka_saja,
-                                    'Update': kolom[3].text.strip()
+                                all_data.append({
+                                    'Province': province_name,
+                                    'Hospital Name': hospital_name,
+                                    'Class': columns[0].text.strip(),
+                                    'Room': columns[1].text.strip(),
+                                    'Available Beds': just_number,
+                                    'Last Update': columns[3].text.strip()
                                 })
             except TimeoutException:
-                pass # Lewati jika kosong/diblokir keras
-            
-            time.sleep(1)
+                print(f" -> Skipped: No data found for {prop_code}")
+                pass 
             
     finally:
         driver.quit()
         
-    if semua_data:
-        df = pd.DataFrame(semua_data)
-        df['Tersedia'] = pd.to_numeric(df['Tersedia']) # Format ke angka
-        file_name = 'data_siranap.csv'
+    if all_data:
+        df = pd.DataFrame(all_data)
+        df['Available Beds'] = pd.to_numeric(df['Available Beds'])
+        
+        # Output dikembalikan menjadi format CSV
+        file_name = 'siranap_data.csv'
         df.to_csv(file_name, index=False)
-        print(f"BERHASIL! {len(df)} baris data disimpan.")
+        
+        print(f"SUCCESS! {len(df)} rows of data saved to CSV.")
     else:
-        print("GAGAL: Tidak ada data yang berhasil ditarik.")
+        print("FAILED: No data was extracted.")
 
 if __name__ == "__main__":
-    jalankan_scraper()
+    run_fast_scraper()
