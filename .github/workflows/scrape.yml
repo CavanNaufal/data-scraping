@@ -2,8 +2,8 @@ name: Scraping Siranap Otomatis
 
 on:
   schedule:
-    # 01 = 08:00 WIB, 05 = 12:00 WIB, 10 = 17:00 WIB
-    - cron: '0 1,5,10 * * *'
+    - cron: '0 7,14 * * *'
+      timezone: Asia/Jakarta
   workflow_dispatch:
 
 permissions:
@@ -14,10 +14,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Tarik Kode dari Repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Siapkan Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
