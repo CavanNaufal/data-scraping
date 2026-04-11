@@ -2,9 +2,7 @@ name: Automated Siranap Scraper
 
 on:
   schedule:
-    # Berjalan pada jam 9, 11, 13, 15, 17 WIB
-    - cron: '0 9,11,13,15,17 * * *'
-      timezone: Asia/Jakarta
+    - cron: '0 */2 * * *'
   workflow_dispatch:
 
 permissions:
