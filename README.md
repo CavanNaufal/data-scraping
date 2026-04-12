@@ -5,7 +5,7 @@ Automated scraper untuk data ketersediaan tempat tidur rumah sakit dari [SIRANAP
 ## Arsitektur
 
 ```
-SIRANAP Website ──> Scrapper.py ──┬──> Power BI (Streaming Dataset)
+SIRANAP Website ──> scraper.py ──┬──> Power BI (Streaming Dataset)
     (38 provinsi)     (async)     └──> siranap_data.csv (backup)
 ```
 
