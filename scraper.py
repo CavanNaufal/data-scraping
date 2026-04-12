@@ -121,7 +121,7 @@ async def run():
         push_tasks = [
             pbi.post(
                 POWER_BI_URL,
-                content=payload,
+                data=payload,
                 headers={"Content-Type": "application/json"},
                 timeout=30,
             )
