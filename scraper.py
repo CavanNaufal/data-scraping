@@ -68,14 +68,13 @@ def run_fast_scraper():
                                 number_match = re.search(r'\d+', availability_text)
                                 just_number = number_match.group() if number_match else "0"
                                 
-                                # MENAMBAHKAN KOLOM 'Sent Date'
                                 all_data.append({
                                     'Province': province_name,
                                     'Hospital Name': hospital_name,
                                     'Class': columns[0].text.strip(),
                                     'Room': columns[1].text.strip(),
                                     'Available Beds': int(just_number),
-                                    'Sent Date': wib_now  # Data tanggal pengiriman
+                                    'Sent Date': wib_now
                                 })
             except TimeoutException:
                 pass 
@@ -84,17 +83,43 @@ def run_fast_scraper():
         driver.quit()
         
     if all_data:
-        print(f"Sending {len(all_data)} rows to Power BI with timestamp: {wib_now}")
+        # BACKUP KE CSV DI GITHUB
+        df = pd.DataFrame(all_data)
+        file_name = 'siranap_data.csv'
+        df.to_csv(file_name, index=False)
+        print(f"Backup CSV tersimpan.")
+
+        # PROSES MENGIRIM KE POWER BI DENGAN SISTEM BATCH (CICILAN)
+        total_rows = len(all_data)
+        print(f"Bersiap mengirim {total_rows} baris ke Power BI dengan timestamp: {wib_now}")
+        
         POWER_BI_URL = "https://api.powerbi.com/beta/af8e89a3-d9ac-422f-ad06-cc4eb4214314/datasets/48556833-2571-428b-a725-ffd9e90bc6e5/rows?experience=power-bi&key=Qmh7sw4QuTYGzScXKhRZi4EvslgSelbHSo5ZYuDXc9rzr7HjPt%2FTS4U9nHHuHzeMl9XPSTTpgNZHPO9H%2BcgHAg%3D%3D"
         
-        try:
-            response = requests.post(POWER_BI_URL, json=all_data)
-            if response.status_code == 200:
-                print("SUCCESS! Data and timestamp sent.")
-            else:
-                print(f"FAILED! Status code: {response.status_code}")
-        except Exception as e:
-            print(f"Error: {e}")
+        # Batas aman Power BI adalah 10.000. Kita gunakan 5.000 agar sangat aman.
+        batch_size = 5000 
+        
+        for i in range(0, total_rows, batch_size):
+            # Memotong array data menjadi paket kecil
+            batch_data = all_data[i:i + batch_size]
+            batch_number = (i // batch_size) + 1
+            
+            print(f"Mengirim Paket {batch_number} (Baris {i+1} sampai {min(i+batch_size, total_rows)})...")
+            
+            try:
+                response = requests.post(POWER_BI_URL, json=batch_data)
+                if response.status_code == 200:
+                    print(f" -> Paket {batch_number} SUKSES terkirim!")
+                else:
+                    print(f" -> Paket {batch_number} GAGAL! Status code: {response.status_code}")
+            except Exception as e:
+                print(f" -> Error pada Paket {batch_number}: {e}")
+                
+            # Beri jeda 1 detik antar paket agar server Power BI tidak menganggapnya serangan spam
+            time.sleep(1)
+            
+        print("SELURUH PROSES PENGIRIMAN SELESAI!")
+    else:
+        print("GAGAL: Tidak ada data yang ditarik.")
 
 if __name__ == "__main__":
     run_fast_scraper()
