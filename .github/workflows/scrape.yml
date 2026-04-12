@@ -2,12 +2,15 @@ name: Automated Siranap Scraper
 
 on:
   schedule:
-    - cron: '0 */2 * * *'
-  workflow_dispatch:
+    # Jadwal: 02:00, 04:00, 06:00, 08:00, 10:00 UTC
+    # Sama dengan: 09:00, 11:00, 13:00, 15:00, 17:00 WIB
+    - cron: '0 2,4,6,8,10 * * *'
+  workflow_dispatch: # Mengizinkan eksekusi manual via tombol "Run workflow"
 
 permissions:
   contents: write
 
+# Konfigurasi ini akan menghilangkan peringatan kuning Node.js 20
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -35,16 +38,18 @@ jobs:
 
       - name: Execute Scraper
         run: |
+          # Menghapus paksa semua jejak ChromeDriver versi lama agar tidak bentrok
           sudo rm -f /usr/bin/chromedriver
           sudo rm -f /usr/local/bin/chromedriver
           sudo rm -f /usr/local/share/chrome_driver/chromedriver
-          # Menggunakan -u agar log terlihat secara real-time
+          
+          # Menggunakan -u agar log muncul secara real-time di layar GitHub
           python -u scraper.py
 
-      - name: Save CSV to GitHub
+      - name: Save CSV Backup to GitHub
         run: |
           git config --global user.name "GitHub Action Bot"
           git config --global user.email "action@github.com"
           git add siranap_data.csv
-          git commit -m "Update SIRANAP data (Every 2 Hours)" || echo "No data changes"
+          git commit -m "Auto-update SIRANAP CSV Backup" || echo "No data changes"
           git push
