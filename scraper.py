@@ -24,7 +24,7 @@ def run_fast_scraper():
     driver = webdriver.Chrome(options=chrome_options)
     all_data = []
     
-    # Mengambil Waktu Sekarang dalam WIB (UTC+7)
+    # Timestamp WIB (UTC+7)
     wib_now = datetime.now(timezone(timedelta(hours=7))).strftime('%Y-%m-%dT%H:%M:%S.000Z')
     
     province_codes = [
@@ -83,43 +83,46 @@ def run_fast_scraper():
         driver.quit()
         
     if all_data:
-        # BACKUP KE CSV DI GITHUB
-        df = pd.DataFrame(all_data)
-        file_name = 'siranap_data.csv'
-        df.to_csv(file_name, index=False)
-        print(f"Backup CSV tersimpan.")
-
-        # PROSES MENGIRIM KE POWER BI DENGAN SISTEM BATCH (CICILAN)
-        total_rows = len(all_data)
-        print(f"Bersiap mengirim {total_rows} baris ke Power BI dengan timestamp: {wib_now}")
-        
+        # URL API POWER BI ANDA
         POWER_BI_URL = "https://api.powerbi.com/beta/af8e89a3-d9ac-422f-ad06-cc4eb4214314/datasets/48556833-2571-428b-a725-ffd9e90bc6e5/rows?experience=power-bi&key=Qmh7sw4QuTYGzScXKhRZi4EvslgSelbHSo5ZYuDXc9rzr7HjPt%2FTS4U9nHHuHzeMl9XPSTTpgNZHPO9H%2BcgHAg%3D%3D"
+
+        # --- LANGKAH STRATEGI REPLACE: HAPUS DATA LAMA ---
+        print("Menyapu bersih data lama di Power BI...")
+        try:
+            # Mengirim request DELETE untuk mengosongkan dataset
+            response_del = requests.delete(POWER_BI_URL)
+            if response_del.status_code == 200:
+                print("Data lama berhasil dihapus. Memulai pengiriman data segar...")
+            else:
+                print(f"Catatan: Perintah hapus merespon {response_del.status_code}. Melanjutkan pengiriman.")
+        except Exception as e:
+            print(f"Gagal perintah hapus: {e}. Melanjutkan pengiriman.")
         
-        # Batas aman Power BI adalah 10.000. Kita gunakan 5.000 agar sangat aman.
+        time.sleep(2) # Jeda singkat setelah penghapusan
+        # ------------------------------------------------
+
+        total_rows = len(all_data)
         batch_size = 5000 
         
         for i in range(0, total_rows, batch_size):
-            # Memotong array data menjadi paket kecil
             batch_data = all_data[i:i + batch_size]
             batch_number = (i // batch_size) + 1
-            
-            print(f"Mengirim Paket {batch_number} (Baris {i+1} sampai {min(i+batch_size, total_rows)})...")
+            print(f"Mengirim Paket {batch_number}...")
             
             try:
                 response = requests.post(POWER_BI_URL, json=batch_data)
                 if response.status_code == 200:
-                    print(f" -> Paket {batch_number} SUKSES terkirim!")
+                    print(f" -> Paket {batch_number} SUKSES.")
                 else:
-                    print(f" -> Paket {batch_number} GAGAL! Status code: {response.status_code}")
+                    print(f" -> Paket {batch_number} GAGAL ({response.status_code}).")
             except Exception as e:
-                print(f" -> Error pada Paket {batch_number}: {e}")
+                print(f" -> Error Paket {batch_number}: {e}")
                 
-            # Beri jeda 1 detik antar paket agar server Power BI tidak menganggapnya serangan spam
             time.sleep(1)
             
-        print("SELURUH PROSES PENGIRIMAN SELESAI!")
+        print(f"PROSES SELESAI! Data {total_rows} baris sekarang adalah satu-satunya data di Power BI.")
     else:
-        print("GAGAL: Tidak ada data yang ditarik.")
+        print("GAGAL: Tidak ada data.")
 
 if __name__ == "__main__":
     run_fast_scraper()
