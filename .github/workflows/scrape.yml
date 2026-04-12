@@ -23,13 +23,13 @@ jobs:
         uses: astral-sh/setup-uv@v4
         with:
           enable-cache: true
-          cache-dependency-glob: "requirements.txt"
+          cache-dependency-glob: "requirements*.txt"
 
       - name: Install & Run Scraper
         run: |
-          uv pip install --system -r requirements.txt &
-          INSTALL_PID=$!
-          wait $INSTALL_PID
+          uv venv .venv
+          source .venv/bin/activate
+          uv pip install -r requirements.txt
           python -u Scrapper.py
 
       - name: Save CSV Backup to GitHub
