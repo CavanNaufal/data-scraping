@@ -1,13 +1,11 @@
 import asyncio
 import csv
-import io
 import re
 import time
 import json
 from curl_cffi.requests import AsyncSession
 from selectolax.parser import HTMLParser
 from datetime import datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor
 
 _NUMBER_RE = re.compile(r'\d+')
 _FIELDS = ['Province', 'Hospital Name', 'Class', 'Room', 'Available Beds', 'Sent Date']
@@ -54,40 +52,41 @@ def parse_province(html: str, kode_prop: str, wib_now: str) -> list[dict]:
 
 
 def write_csv(all_data: list[dict]):
-    buf = io.StringIO()
-    w = csv.DictWriter(buf, fieldnames=_FIELDS)
-    w.writeheader()
-    w.writerows(all_data)
     with open('siranap_data.csv', 'w', newline='', encoding='utf-8') as f:
-        f.write(buf.getvalue())
+        w = csv.DictWriter(f, fieldnames=_FIELDS)
+        w.writeheader()
+        w.writerows(all_data)
 
 
 async def run():
     total_start = time.perf_counter()
     wib_now = datetime.now(timezone(timedelta(hours=7))).strftime('%Y-%m-%dT%H:%M:%S.000Z')
-    pool = ThreadPoolExecutor(max_workers=4)
-    loop = asyncio.get_running_loop()
 
-    # --- FASE 1: Scrape semua provinsi ---
-    print("1. Scrape 38 provinsi (curl_cffi + selectolax)...")
+    print("1. Scrape 38 provinsi...")
     t0 = time.perf_counter()
 
-    async with AsyncSession(impersonate="chrome120", max_clients=40) as s:
-        await s.get('https://keslan.kemkes.go.id/app/siranap/', timeout=10)
+    async with AsyncSession(impersonate="chrome120", max_clients=50) as s:
+
+        # Warm-up + scrape provinsi pertama berjalan BERSAMAAN
+        async def warmup():
+            await s.get('https://keslan.kemkes.go.id/app/siranap/', timeout=10)
 
         async def fetch(code: int) -> list[dict]:
             kode = f"{code}prop"
             try:
                 r = await s.get(BASE_URL.format(code), timeout=12)
-                # Parsing di thread pool agar tidak blocking event loop
-                return await loop.run_in_executor(
-                    pool, parse_province, r.text, kode, wib_now
-                )
+                return parse_province(r.text, kode, wib_now)
             except Exception as e:
                 print(f" -> Gagal {kode}: {e}")
                 return []
 
-        results = await asyncio.gather(*[fetch(c) for c in PROVINCE_CODES])
+        # Fire warm-up dan semua 38 fetch sekaligus
+        warmup_task = asyncio.create_task(warmup())
+        fetch_tasks = [asyncio.create_task(fetch(c)) for c in PROVINCE_CODES]
+
+        # Tunggu warm-up selesai dulu (cookie didapat), baru hasil fetch valid
+        await warmup_task
+        results = await asyncio.gather(*fetch_tasks)
 
     all_data = []
     for res in results:
@@ -99,37 +98,25 @@ async def run():
         print("GAGAL: Datanya kosong.")
         return
 
-    # --- FASE 2: CSV + Power BI push paralel ---
+    # --- CSV + Power BI push SERENTAK ---
     total_rows = len(all_data)
-    print(f"\n2. Push {total_rows} baris ke Power BI...")
+    print(f"\n2. Push {total_rows} baris...")
     t1 = time.perf_counter()
 
-    # Pre-encode JSON di thread pool sementara CSV ditulis
-    batch_size = 5000
+    batch_size = 10000
     raw_batches = [all_data[i:i + batch_size] for i in range(0, total_rows, batch_size)]
+    encoded = [json.dumps(b).encode() for b in raw_batches]
 
-    csv_future = loop.run_in_executor(pool, write_csv, all_data)
-    encode_futures = [
-        loop.run_in_executor(pool, lambda b=b: json.dumps(b).encode(), )
-        for b in raw_batches
-    ]
+    loop = asyncio.get_running_loop()
+    csv_future = loop.run_in_executor(None, write_csv, all_data)
 
-    encoded_batches = await asyncio.gather(*encode_futures)
-    # CSV mungkin masih berjalan — tidak perlu ditunggu sebelum push
-
-    async with AsyncSession(impersonate="chrome120", max_clients=len(raw_batches) + 1) as pbi:
+    async with AsyncSession(impersonate="chrome120", max_clients=len(encoded) + 1) as pbi:
         push_tasks = [
-            pbi.post(
-                POWER_BI_URL,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=30,
-            )
-            for payload in encoded_batches
+            pbi.post(POWER_BI_URL, data=p, headers={"Content-Type": "application/json"}, timeout=30)
+            for p in encoded
         ]
         await asyncio.gather(csv_future, *push_tasks)
 
-    pool.shutdown(wait=False)
     print(f" -> Push selesai: {time.perf_counter() - t1:.1f}s")
     print(f"\nTOTAL: {time.perf_counter() - total_start:.1f}s | {total_rows} baris.")
 
