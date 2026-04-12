@@ -19,7 +19,6 @@ def run_ultra_fast_scraper():
     
     driver = webdriver.Chrome(options=chrome_options)
     
-    # KODE PROVINSI BPS
     province_codes = [
         11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 
         31, 32, 33, 34, 35, 36, 
@@ -39,7 +38,7 @@ def run_ultra_fast_scraper():
         selenium_cookies = driver.get_cookies()
         print(" -> Izin didapat! Mematikan Selenium...")
     finally:
-        driver.quit() # Matikan browser berat ini secepatnya
+        driver.quit() 
         
     print("\n2. Memulai Armada Requests (Multi-Threading 10 Jalur)...")
     session = requests.Session()
@@ -51,7 +50,6 @@ def run_ultra_fast_scraper():
 
     wib_now = datetime.now(timezone(timedelta(hours=7))).strftime('%Y-%m-%dT%H:%M:%S.000Z')
     
-    # Fungsi kecil untuk mengekstrak 1 provinsi secepat kilat
     def scrape_province(prop_code):
         local_data = []
         kode_prop = f"{prop_code}prop"
@@ -108,14 +106,9 @@ def run_ultra_fast_scraper():
         df = pd.DataFrame(all_data)
         df.to_csv('siranap_data.csv', index=False)
         
-        # PUSH KE POWER BI (STRATEGI REPLACE)
-        print("3. Mengirim ke Power BI...")
+        # PUSH KE POWER BI
+        print("3. Mengirim ke Power BI secara Batching...")
         POWER_BI_URL = "https://api.powerbi.com/beta/af8e89a3-d9ac-422f-ad06-cc4eb4214314/datasets/48556833-2571-428b-a725-ffd9e90bc6e5/rows?experience=power-bi&key=Qmh7sw4QuTYGzScXKhRZi4EvslgSelbHSo5ZYuDXc9rzr7HjPt%2FTS4U9nHHuHzeMl9XPSTTpgNZHPO9H%2BcgHAg%3D%3D"
-        
-        try:
-            requests.delete(POWER_BI_URL)
-        except:
-            pass
         
         total_rows = len(all_data)
         batch_size = 5000 
@@ -124,7 +117,8 @@ def run_ultra_fast_scraper():
             batch_data = all_data[i:i + batch_size]
             try:
                 requests.post(POWER_BI_URL, json=batch_data)
-            except:
+            except Exception as e:
+                print(f" -> Gagal Post Batch: {e}")
                 pass
                 
         print(f"SEMPURNA! {total_rows} baris sukses mendarat.")
