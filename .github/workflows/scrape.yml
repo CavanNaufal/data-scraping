@@ -30,7 +30,7 @@ jobs:
           uv venv .venv
           source .venv/bin/activate
           uv pip install -r requirements.txt
-          python -u Scrapper.py
+          python -u scraper.py
 
       - name: Save CSV Backup to GitHub
         run: |
