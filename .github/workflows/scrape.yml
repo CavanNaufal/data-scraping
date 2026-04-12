@@ -8,9 +8,9 @@ on:
 permissions:
   contents: write
 
-# Menghindari peringatan/error Node.js usang
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  UV_CACHE_DIR: /tmp/uv-cache
 
 jobs:
   run-scraper:
@@ -19,24 +19,21 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v4
         with:
-          python-version: '3.10'
-          cache: 'pip' # Mengaktifkan cache agar instalasi secepat kilat
+          enable-cache: true
 
-      - name: Install Python Dependencies
-        run: pip install -r requirements.txt
-
-      - name: Execute Scraper
+      - name: Install & Run Scraper
         run: |
-          # Langsung jalankan Python dengan output real-time (-u)
-          python -u scraper.py
+          uv pip install --system -r requirements.txt &
+          INSTALL_PID=$!
+          wait $INSTALL_PID
+          python -u Scrapper.py
 
       - name: Save CSV Backup to GitHub
         run: |
           git config --global user.name "GitHub Action Bot"
           git config --global user.email "action@github.com"
           git add siranap_data.csv
-          git commit -m "Auto-update SIRANAP CSV Backup" || echo "No data changes"
-          git push
+          git diff --cached --quiet && echo "No data changes" || git commit -m "Auto-update SIRANAP CSV Backup" && git push
