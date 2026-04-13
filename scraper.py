@@ -66,27 +66,27 @@ async def run():
     t0 = time.perf_counter()
 
     async with AsyncSession(impersonate="chrome120", max_clients=50) as s:
-
-        # Warm-up + scrape provinsi pertama berjalan BERSAMAAN
-        async def warmup():
-            await s.get('https://keslan.kemkes.go.id/app/siranap/', timeout=10)
+        for attempt in range(1, 4):
+            try:
+                print(f" -> Warm-up attempt {attempt}...")
+                await s.get('https://keslan.kemkes.go.id/app/siranap/', timeout=20)
+                break
+            except Exception as e:
+                if attempt == 3:
+                    print(f" -> Warm-up gagal setelah 3 percobaan: {e}")
+                    return
+                await asyncio.sleep(2)
 
         async def fetch(code: int) -> list[dict]:
             kode = f"{code}prop"
             try:
-                r = await s.get(BASE_URL.format(code), timeout=12)
+                r = await s.get(BASE_URL.format(code), timeout=15)
                 return parse_province(r.text, kode, wib_now)
             except Exception as e:
                 print(f" -> Gagal {kode}: {e}")
                 return []
 
-        # Fire warm-up dan semua 38 fetch sekaligus
-        warmup_task = asyncio.create_task(warmup())
-        fetch_tasks = [asyncio.create_task(fetch(c)) for c in PROVINCE_CODES]
-
-        # Tunggu warm-up selesai dulu (cookie didapat), baru hasil fetch valid
-        await warmup_task
-        results = await asyncio.gather(*fetch_tasks)
+        results = await asyncio.gather(*[fetch(c) for c in PROVINCE_CODES])
 
     all_data = []
     for res in results:
