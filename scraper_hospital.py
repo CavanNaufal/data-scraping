@@ -12,7 +12,7 @@ _NUMBER_RE = re.compile(r'\d+')
 
 _FIELDS = [
     'Province', 'Hospital Name', 'Class', 
-    'Total Beds', 'Available Beds', 'Occupied Beds', 'BOR (%)', 
+    'Total Beds', 'Available Beds', 'Occupied Beds', 'BOR', 
     'Sent Date'
 ]
 
