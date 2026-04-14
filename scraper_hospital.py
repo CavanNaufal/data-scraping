@@ -105,14 +105,17 @@ async def run():
 
     async with AsyncSession(impersonate="chrome120", max_clients=70) as session:
 
-        # -- Fase 1: ambil semua provinsi, retry sampai 100% --
+        MAX_ROUNDS = 5
+
+        # -- Fase 1: ambil semua provinsi, retry maks MAX_ROUNDS ronde --
         # None = request gagal (retry), list = berhasil (bisa kosong)
         print("1. Mengambil daftar RS per provinsi...")
         remaining_provs = list(PROVINCE_CODES)
         hospital_list = []
-        prov_round = 0
-        while remaining_provs:
-            prov_round += 1
+        skipped_provs = []
+        for prov_round in range(1, MAX_ROUNDS + 1):
+            if not remaining_provs:
+                break
             if prov_round > 1:
                 print(f"   Retry provinsi ronde {prov_round}: {len(remaining_provs)} tersisa...")
                 await asyncio.sleep(2.0)
@@ -120,8 +123,8 @@ async def run():
             async def fetch_province(code: int):
                 r = await _fetch(session, sem, PROVINCE_URL.format(code))
                 if not r:
-                    return code, None  # request gagal
-                return code, extract_hospital_codes(r.text, str(code))  # list (bisa kosong)
+                    return code, None
+                return code, extract_hospital_codes(r.text, str(code))
 
             results = await asyncio.gather(*[fetch_province(c) for c in remaining_provs])
             still_failed = []
@@ -132,18 +135,23 @@ async def run():
                     hospital_list.extend(hospitals)
             remaining_provs = still_failed
 
-        prov_ok = len(PROVINCE_CODES) - len(remaining_provs)
+        if remaining_provs:
+            skipped_provs = remaining_provs
+            print(f"   PERINGATAN: {len(skipped_provs)} provinsi gagal setelah {MAX_ROUNDS} ronde: {skipped_provs}")
+
+        prov_ok = len(PROVINCE_CODES) - len(skipped_provs)
         print(f"   -> {prov_ok}/{len(PROVINCE_CODES)} provinsi OK, {len(hospital_list)} RS ditemukan.")
 
-        # -- Fase 2: ambil detail RS, retry sampai 100% --
+        # -- Fase 2: ambil detail RS, retry maks MAX_ROUNDS ronde --
         # None = request gagal (retry), list = berhasil (bisa kosong)
         print("2. Mengambil detail tempat tidur...")
         all_data = []
         remaining_hosps = list(hospital_list)
         empty_count = 0
-        hosp_round = 0
-        while remaining_hosps:
-            hosp_round += 1
+        skipped_hosps = []
+        for hosp_round in range(1, MAX_ROUNDS + 1):
+            if not remaining_hosps:
+                break
             if hosp_round > 1:
                 print(f"   Retry RS ronde {hosp_round}: {len(remaining_hosps)} tersisa...")
                 await asyncio.sleep(3.0)
@@ -151,7 +159,7 @@ async def run():
             async def fetch_hosp(hosp: dict):
                 r = await _fetch(session, sem, HOSPITAL_URL.format(hosp['kode_rs'], hosp['prop_code']))
                 if not r:
-                    return hosp, None  # request gagal
+                    return hosp, None
                 return hosp, parse_hospital_detail(r.text, hosp['Province'], hosp['Hospital Name'], wib_now)
 
             results = await asyncio.gather(*[fetch_hosp(h) for h in remaining_hosps])
@@ -162,11 +170,18 @@ async def run():
                 elif data:
                     all_data.extend(data)
                 else:
-                    empty_count += 1  # halaman berhasil diakses tapi memang kosong
+                    empty_count += 1
             remaining_hosps = still_failed
             done = len(hospital_list) - len(remaining_hosps)
             print(f"   ... {done}/{len(hospital_list)} RS")
 
+        if remaining_hosps:
+            skipped_hosps = remaining_hosps
+            print(f"   PERINGATAN: {len(skipped_hosps)} RS gagal setelah {MAX_ROUNDS} ronde")
+            for h in skipped_hosps[:10]:
+                print(f"     - {h['Hospital Name']} ({h['kode_rs']})")
+            if len(skipped_hosps) > 10:
+                print(f"     ... dan {len(skipped_hosps) - 10} lainnya")
         if empty_count:
             print(f"   ({empty_count} RS tidak memiliki data tempat tidur)")
 
@@ -176,7 +191,12 @@ async def run():
     batches = [json.dumps(all_data[i:i+batch_size]).encode() for i in range(0, len(all_data), batch_size)]
     csv_future = asyncio.get_running_loop().run_in_executor(None, write_csv, all_data)
     async with AsyncSession(impersonate="chrome120", max_clients=5) as pbi:
-        await asyncio.gather(*[pbi.post(POWER_BI_URL, data=b, headers={"Content-Type":"application/json"}, timeout=40) for b in batches])
+        responses = await asyncio.gather(*[pbi.post(POWER_BI_URL, data=b, headers={"Content-Type":"application/json"}, timeout=40) for b in batches])
+        for i, r in enumerate(responses, 1):
+            if r.status_code == 200:
+                print(f"   Batch {i}/{len(batches)} OK")
+            else:
+                print(f"   GAGAL batch {i}/{len(batches)}: HTTP {r.status_code} - {r.text[:200]}")
     await csv_future
     print(f"TOTAL RUNTIME: {time.perf_counter() - total_start:.1f}s")
 
