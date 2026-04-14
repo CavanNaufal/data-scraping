@@ -38,5 +38,5 @@ jobs:
         run: |
           git config --global user.name "GitHub Action Bot"
           git config --global user.email "action@github.com"
-          git add siranap_data_hospital.csv
+          git add siranap_data.csv
           git diff --cached --quiet && echo "No data changes" || git commit -m "Auto-update SIRANAP CSV Backup" && git push
