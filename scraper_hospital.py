@@ -111,11 +111,11 @@ async def run():
     total_start = time.perf_counter()
     wib_now = datetime.now(timezone(timedelta(hours=7))).strftime('%Y-%m-%dT%H:%M:%S.000Z')
 
-    sem = asyncio.Semaphore(120)
+    sem = asyncio.Semaphore(100)
     all_results: list[asyncio.Task] = []
     total_hosps = [0]
 
-    async with AsyncSession(impersonate="chrome120", max_clients=150) as session:
+    async with AsyncSession(impersonate="chrome120", max_clients=120) as session:
 
         async def fetch_hosp(hosp: dict) -> tuple[dict, list | None]:
             r = await _fetch(session, sem, HOSPITAL_URL.format(hosp['kode_rs'], hosp['prop_code']))
