@@ -32,11 +32,11 @@ jobs:
           uv venv .venv
           source .venv/bin/activate
           uv pip install -r requirements.txt
-          python -u scraper.py
+          python -u scraper_hospital.py
 
       - name: Save CSV Backup to GitHub
         run: |
           git config --global user.name "GitHub Action Bot"
           git config --global user.email "action@github.com"
-          git add siranap_data.csv
+          git add siranap_data_hospital.csv
           git diff --cached --quiet && echo "No data changes" || git commit -m "Auto-update SIRANAP CSV Backup" && git push
