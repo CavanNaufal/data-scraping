@@ -21,7 +21,7 @@ PROVINCE_CODES = [
 ]
 
 BASE_URL = 'https://keslan.kemkes.go.id/app/siranap/rumah_sakit?jenis=2&propinsi={}prop&kabkota='
-POWER_BI_URL = "https://api.powerbi.com/beta/af8e89a3-d9ac-422f-ad06-cc4eb4214314/datasets/48556833-2571-428b-a725-ffd9e90bc6e5/rows?experience=power-bi&key=Qmh7sw4QuTYGzScXKhRZi4EvslgSelbHSo5ZYuDXc9rzr7HjPt%2FTS4U9nHHuHzeMl9XPSTTpgNZHPO9H%2BcgHAg%3D%3D"
+POWER_BI_URL = os.environ.get("POWER_BI_URL")
 
 
 def parse_province(html: str, kode_prop: str, wib_now: str) -> list[dict]:
