@@ -82,10 +82,8 @@ def write_csv(all_data: list[dict]):
         csv.DictWriter(f, fieldnames=_FIELDS).writeheader()
         csv.DictWriter(f, fieldnames=_FIELDS).writerows(all_data)
 
-_MAX_ATTEMPTS = 4
-
-async def _fetch(session, sem, url, timeout=20):
-    for attempt in range(_MAX_ATTEMPTS):
+async def _fetch(session, sem, url, timeout=15):
+    for attempt in range(2):
         async with sem:
             try:
                 r = await session.get(url, timeout=timeout)
@@ -93,8 +91,8 @@ async def _fetch(session, sem, url, timeout=20):
                     return r
             except Exception:
                 pass
-        if attempt < _MAX_ATTEMPTS - 1:
-            await asyncio.sleep(0.5 + attempt * 0.5)
+        if attempt == 0:
+            await asyncio.sleep(0.3)
     return None
 
 async def run():
@@ -104,11 +102,11 @@ async def run():
     total_start = time.perf_counter()
     wib_now = datetime.now(timezone(timedelta(hours=7))).strftime('%Y-%m-%dT%H:%M:%S.000Z')
 
-    sem = asyncio.Semaphore(60)
+    sem = asyncio.Semaphore(100)
     all_results: list[asyncio.Task] = []
     total_hosps = [0]
 
-    async with AsyncSession(impersonate="chrome120", max_clients=80) as session:
+    async with AsyncSession(impersonate="chrome120", max_clients=120) as session:
 
         async def fetch_hosp(hosp: dict) -> tuple[dict, list | None]:
             r = await _fetch(session, sem, HOSPITAL_URL.format(hosp['kode_rs'], hosp['prop_code']))
@@ -130,7 +128,7 @@ async def run():
         print("Scraping provinsi + detail RS (pipeline)...")
         prov_remaining = list(PROVINCE_CODES)
         prov_skipped = []
-        MAX_ROUNDS = 3
+        MAX_ROUNDS = 5
         for ronde in range(1, MAX_ROUNDS + 1):
             if not prov_remaining:
                 break
@@ -164,7 +162,7 @@ async def run():
             if not failed_hosps:
                 break
             print(f"   Retry {len(failed_hosps)} RS (ronde {ronde})...")
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.5)
             retry_results = await asyncio.gather(*[fetch_hosp(h) for h in failed_hosps])
             still_failed = []
             for hosp, data in retry_results:
