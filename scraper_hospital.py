@@ -72,7 +72,7 @@ def parse_hospital_detail(html: str, prov_name: str, hosp_name: str, wib_now: st
                 local_data.append({
                     'Province': prov_name, 'Hospital Name': hosp_name, 'Class': class_name,
                     'Total Beds': total, 'Available Beds': avail, 'Occupied Beds': max(0, occupied),
-                    'BOR (%)': bor, 'Sent Date': wib_now
+                    'BOR': bor, 'Sent Date': wib_now
                 })
             except: pass
     return local_data
