@@ -26,6 +26,8 @@ jobs:
           cache-dependency-glob: "requirements*.txt"
 
       - name: Install & Run Scraper
+        env:
+          POWER_BI_URL: ${{ secrets.POWER_BI_URL }}
         run: |
           uv venv .venv
           source .venv/bin/activate
