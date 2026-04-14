@@ -82,10 +82,6 @@ def write_csv(all_data: list[dict]):
         csv.DictWriter(f, fieldnames=_FIELDS).writeheader()
         csv.DictWriter(f, fieldnames=_FIELDS).writerows(all_data)
 
-_BROWSERS = ["chrome120", "chrome119", "chrome116", "edge101"]
-_NUM_POOLS = len(_BROWSERS)
-_SEM_PER_POOL = 30
-_CLIENTS_PER_POOL = 40
 MAX_ROUNDS = 5
 
 async def _fetch(session, sem, url, timeout=15):
@@ -108,42 +104,31 @@ async def run():
     total_start = time.perf_counter()
     wib_now = datetime.now(timezone(timedelta(hours=7))).strftime('%Y-%m-%dT%H:%M:%S.000Z')
 
-    # -- Buat pool session dengan fingerprint berbeda --
-    pools = []
-    for browser in _BROWSERS:
-        s = AsyncSession(impersonate=browser, max_clients=_CLIENTS_PER_POOL)
-        pools.append((s, asyncio.Semaphore(_SEM_PER_POOL)))
-    _pool_idx = [0]
-
-    def next_pool():
-        idx = _pool_idx[0] % _NUM_POOLS
-        _pool_idx[0] += 1
-        return pools[idx]
-
+    sem = asyncio.Semaphore(100)
     all_results: list[asyncio.Task] = []
     total_hosps = [0]
 
-    async def fetch_hosp(hosp: dict) -> tuple[dict, list | None]:
-        session, sem = next_pool()
-        r = await _fetch(session, sem, HOSPITAL_URL.format(hosp['kode_rs'], hosp['prop_code']))
-        if not r:
-            return hosp, None
-        return hosp, parse_hospital_detail(r.text, hosp['Province'], hosp['Hospital Name'], wib_now)
+    async with AsyncSession(impersonate="chrome120", max_clients=120) as session:
 
-    async def fetch_province(code: int):
-        session, sem = next_pool()
-        r = await _fetch(session, sem, PROVINCE_URL.format(code))
-        if not r:
-            return code, None
-        hospitals = extract_hospital_codes(r.text, str(code))
-        total_hosps[0] += len(hospitals)
-        for h in hospitals:
-            all_results.append(asyncio.create_task(fetch_hosp(h)))
-        return code, hospitals
+        async def fetch_hosp(hosp: dict) -> tuple[dict, list | None]:
+            r = await _fetch(session, sem, HOSPITAL_URL.format(hosp['kode_rs'], hosp['prop_code']))
+            if not r:
+                return hosp, None
+            return hosp, parse_hospital_detail(r.text, hosp['Province'], hosp['Hospital Name'], wib_now)
 
-    try:
+        async def fetch_province(code: int):
+            r = await _fetch(session, sem, PROVINCE_URL.format(code))
+            if not r:
+                return code, None
+            hospitals = extract_hospital_codes(r.text, str(code))
+            total_hosps[0] += len(hospitals)
+            for h in hospitals:
+                all_results.append(asyncio.create_task(fetch_hosp(h)))
+            return code, hospitals
+
         # -- Fase 1+2 pipeline: provinsi langsung spawn task RS --
-        print(f"Scraping dengan {_NUM_POOLS} session pool (pipeline)...")
+        t0 = time.perf_counter()
+        print("Scraping provinsi + detail RS (pipeline)...")
         prov_remaining = list(PROVINCE_CODES)
         prov_skipped = []
         for ronde in range(1, MAX_ROUNDS + 1):
@@ -158,12 +143,14 @@ async def run():
         if prov_remaining:
             prov_skipped = prov_remaining
             print(f"   PERINGATAN: {len(prov_skipped)} provinsi gagal: {prov_skipped}")
-        print(f"   -> {len(PROVINCE_CODES) - len(prov_skipped)}/{len(PROVINCE_CODES)} provinsi, {total_hosps[0]} RS. Menunggu detail...")
+        t1 = time.perf_counter()
+        print(f"   -> {len(PROVINCE_CODES) - len(prov_skipped)}/{len(PROVINCE_CODES)} provinsi, {total_hosps[0]} RS [{t1-t0:.1f}s]. Menunggu detail...")
 
         # -- Tunggu semua task RS selesai --
         hosp_results = await asyncio.gather(*all_results)
+        t2 = time.perf_counter()
 
-        # -- Retry RS yang gagal --
+        # -- Pisahkan hasil --
         all_data = []
         empty_count = 0
         failed_hosps = []
@@ -174,10 +161,13 @@ async def run():
                 all_data.extend(data)
             else:
                 empty_count += 1
+        print(f"   Pass pertama: {total_hosps[0]-len(failed_hosps)} OK, {len(failed_hosps)} gagal [{t2-t1:.1f}s]")
 
+        # -- Retry RS yang gagal --
         for ronde in range(2, MAX_ROUNDS + 1):
             if not failed_hosps:
                 break
+            tr = time.perf_counter()
             print(f"   Retry {len(failed_hosps)} RS (ronde {ronde})...")
             await asyncio.sleep(0.5)
             retry_results = await asyncio.gather(*[fetch_hosp(h) for h in failed_hosps])
@@ -189,6 +179,8 @@ async def run():
                     all_data.extend(data)
                 else:
                     empty_count += 1
+            recovered = len(failed_hosps) - len(still_failed)
+            print(f"     +{recovered} recovered [{time.perf_counter()-tr:.1f}s]")
             failed_hosps = still_failed
 
         done = total_hosps[0] - len(failed_hosps)
@@ -201,9 +193,6 @@ async def run():
                 print(f"     ... dan {len(failed_hosps) - 10} lainnya")
         if empty_count:
             print(f"   ({empty_count} RS tidak memiliki data tempat tidur)")
-    finally:
-        for s, _ in pools:
-            await s.close()
 
     print(f" -> {len(all_data)} baris dari {total_hosps[0]} RS.\nPush ke Power BI...")
 
