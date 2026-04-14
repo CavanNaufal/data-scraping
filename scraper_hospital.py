@@ -82,6 +82,15 @@ def write_csv(all_data: list[dict]):
         csv.DictWriter(f, fieldnames=_FIELDS).writeheader()
         csv.DictWriter(f, fieldnames=_FIELDS).writerows(all_data)
 
+async def _fetch_with_retry(session, url, timeout=15, retries=1):
+    for attempt in range(retries + 1):
+        try:
+            return await session.get(url, timeout=timeout)
+        except Exception:
+            if attempt == retries:
+                return None
+            await asyncio.sleep(0.3)
+
 async def run():
     if not POWER_BI_URL:
         print("Error: POWER_BI_URL tidak ditemukan.")
@@ -89,43 +98,45 @@ async def run():
     total_start = time.perf_counter()
     wib_now = datetime.now(timezone(timedelta(hours=7))).strftime('%Y-%m-%dT%H:%M:%S.000Z')
 
-    print("1. FASE PENGINTAIAN: Mencari Kode RS...")
-    hospital_list = []
-    async with AsyncSession(impersonate="chrome120", max_clients=15) as s:
-        sem_prov = asyncio.Semaphore(10)
-        async def fetch_prov(code: int):
-            async with sem_prov:
-                try:
-                    r = await s.get(PROVINCE_URL.format(code), timeout=30)
-                    return extract_hospital_codes(r.text, str(code))
-                except: return []
-        prov_results = await asyncio.gather(*[fetch_prov(c) for c in PROVINCE_CODES])
-        for res in prov_results: hospital_list.extend(res)
-
-    print(f" -> Ditemukan {len(hospital_list)} RS.\n2. FASE PENYELAMAN: Ambil Detail...")
     all_data = []
-    progress = 0
-    async with AsyncSession(impersonate="chrome120", max_clients=25) as s2:
-        sem_hosp = asyncio.Semaphore(20)
-        async def fetch_hosp(hosp: dict):
-            nonlocal progress
-            async with sem_hosp:
-                try:
-                    r = await s2.get(HOSPITAL_URL.format(hosp['kode_rs'], hosp['prop_code']), timeout=25)
-                    data = parse_hospital_detail(r.text, hosp['Province'], hosp['Hospital Name'], wib_now)
-                    progress += 1
-                    if progress % 500 == 0: print(f"    ... {progress} RS")
-                    return data
-                except: return []
-        hosp_results = await asyncio.gather(*[fetch_hosp(h) for h in hospital_list])
-        for res in hosp_results: all_data.extend(res)
+    lock = asyncio.Lock()
+    progress = [0]
+    total_hospitals = [0]
 
-    print(f"\n3. Push {len(all_data)} baris ke Power BI...")
+    async with AsyncSession(impersonate="chrome120", max_clients=100) as session:
+        sem = asyncio.Semaphore(80)
+
+        async def fetch_hosp(hosp: dict):
+            async with sem:
+                r = await _fetch_with_retry(session, HOSPITAL_URL.format(hosp['kode_rs'], hosp['prop_code']))
+                if not r:
+                    return
+                data = parse_hospital_detail(r.text, hosp['Province'], hosp['Hospital Name'], wib_now)
+                async with lock:
+                    all_data.extend(data)
+                    progress[0] += 1
+                    if progress[0] % 500 == 0:
+                        print(f"    ... {progress[0]}/{total_hospitals[0]} RS")
+
+        async def fetch_province_and_hospitals(code: int):
+            r = await _fetch_with_retry(session, PROVINCE_URL.format(code))
+            if not r:
+                return
+            hospitals = extract_hospital_codes(r.text, str(code))
+            async with lock:
+                total_hospitals[0] += len(hospitals)
+            await asyncio.gather(*[fetch_hosp(h) for h in hospitals])
+
+        print("Scraping semua provinsi + detail RS (pipeline)...")
+        await asyncio.gather(*[fetch_province_and_hospitals(c) for c in PROVINCE_CODES])
+
+    print(f" -> {len(all_data)} baris dari {progress[0]} RS.\nPush ke Power BI...")
     batch_size = 10000
     batches = [json.dumps(all_data[i:i+batch_size]).encode() for i in range(0, len(all_data), batch_size)]
-    asyncio.get_running_loop().run_in_executor(None, write_csv, all_data)
+    csv_future = asyncio.get_running_loop().run_in_executor(None, write_csv, all_data)
     async with AsyncSession(impersonate="chrome120", max_clients=5) as pbi:
         await asyncio.gather(*[pbi.post(POWER_BI_URL, data=b, headers={"Content-Type":"application/json"}, timeout=40) for b in batches])
+    await csv_future
     print(f"TOTAL RUNTIME: {time.perf_counter() - total_start:.1f}s")
 
 if __name__ == "__main__":
