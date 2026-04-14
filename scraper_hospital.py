@@ -82,6 +82,18 @@ def write_csv(all_data: list[dict]):
         csv.DictWriter(f, fieldnames=_FIELDS).writeheader()
         csv.DictWriter(f, fieldnames=_FIELDS).writerows(all_data)
 
+async def _fetch(session, sem, url, timeout=20):
+    for attempt in range(5):
+        async with sem:
+            try:
+                r = await session.get(url, timeout=timeout)
+                if r.status_code == 200:
+                    return r
+            except Exception:
+                pass
+        await asyncio.sleep(1.5 * (attempt + 1))
+    return None
+
 async def run():
     if not POWER_BI_URL:
         print("Error: POWER_BI_URL tidak ditemukan.")
@@ -89,48 +101,76 @@ async def run():
     total_start = time.perf_counter()
     wib_now = datetime.now(timezone(timedelta(hours=7))).strftime('%Y-%m-%dT%H:%M:%S.000Z')
 
-    sem = asyncio.Semaphore(150)
-    hosp_tasks: list[asyncio.Task] = []
+    sem = asyncio.Semaphore(50)
 
-    async with AsyncSession(impersonate="chrome120", max_clients=200) as session:
+    async with AsyncSession(impersonate="chrome120", max_clients=70) as session:
 
-        async def fetch_hosp(hosp: dict) -> list[dict]:
-            async with sem:
-                for attempt in range(2):
-                    try:
-                        r = await session.get(
-                            HOSPITAL_URL.format(hosp['kode_rs'], hosp['prop_code']),
-                            timeout=12,
-                        )
-                        return parse_hospital_detail(r.text, hosp['Province'], hosp['Hospital Name'], wib_now)
-                    except Exception:
-                        if attempt == 1:
-                            return []
+        # -- Fase 1: ambil semua provinsi, retry sampai 100% --
+        # None = request gagal (retry), list = berhasil (bisa kosong)
+        print("1. Mengambil daftar RS per provinsi...")
+        remaining_provs = list(PROVINCE_CODES)
+        hospital_list = []
+        prov_round = 0
+        while remaining_provs:
+            prov_round += 1
+            if prov_round > 1:
+                print(f"   Retry provinsi ronde {prov_round}: {len(remaining_provs)} tersisa...")
+                await asyncio.sleep(2.0)
 
-        async def fetch_province(code: int):
-            for attempt in range(2):
-                try:
-                    r = await session.get(PROVINCE_URL.format(code), timeout=12)
-                    hospitals = extract_hospital_codes(r.text, str(code))
-                    for h in hospitals:
-                        hosp_tasks.append(asyncio.create_task(fetch_hosp(h)))
-                    return
-                except Exception:
-                    if attempt == 1:
-                        return
+            async def fetch_province(code: int):
+                r = await _fetch(session, sem, PROVINCE_URL.format(code))
+                if not r:
+                    return code, None  # request gagal
+                return code, extract_hospital_codes(r.text, str(code))  # list (bisa kosong)
 
-        print("Scraping semua provinsi + detail RS (pipeline)...")
-        await asyncio.gather(*[fetch_province(c) for c in PROVINCE_CODES])
-        print(f" -> {len(hosp_tasks)} RS ditemukan, mengambil detail...")
-        results = await asyncio.gather(*hosp_tasks)
+            results = await asyncio.gather(*[fetch_province(c) for c in remaining_provs])
+            still_failed = []
+            for code, hospitals in results:
+                if hospitals is None:
+                    still_failed.append(code)
+                else:
+                    hospital_list.extend(hospitals)
+            remaining_provs = still_failed
 
-    all_data = []
-    done = 0
-    for res in results:
-        if res:
-            all_data.extend(res)
-            done += 1
-    print(f" -> {len(all_data)} baris dari {done} RS.\nPush ke Power BI...")
+        prov_ok = len(PROVINCE_CODES) - len(remaining_provs)
+        print(f"   -> {prov_ok}/{len(PROVINCE_CODES)} provinsi OK, {len(hospital_list)} RS ditemukan.")
+
+        # -- Fase 2: ambil detail RS, retry sampai 100% --
+        # None = request gagal (retry), list = berhasil (bisa kosong)
+        print("2. Mengambil detail tempat tidur...")
+        all_data = []
+        remaining_hosps = list(hospital_list)
+        empty_count = 0
+        hosp_round = 0
+        while remaining_hosps:
+            hosp_round += 1
+            if hosp_round > 1:
+                print(f"   Retry RS ronde {hosp_round}: {len(remaining_hosps)} tersisa...")
+                await asyncio.sleep(3.0)
+
+            async def fetch_hosp(hosp: dict):
+                r = await _fetch(session, sem, HOSPITAL_URL.format(hosp['kode_rs'], hosp['prop_code']))
+                if not r:
+                    return hosp, None  # request gagal
+                return hosp, parse_hospital_detail(r.text, hosp['Province'], hosp['Hospital Name'], wib_now)
+
+            results = await asyncio.gather(*[fetch_hosp(h) for h in remaining_hosps])
+            still_failed = []
+            for hosp, data in results:
+                if data is None:
+                    still_failed.append(hosp)
+                elif data:
+                    all_data.extend(data)
+                else:
+                    empty_count += 1  # halaman berhasil diakses tapi memang kosong
+            remaining_hosps = still_failed
+            done = len(hospital_list) - len(remaining_hosps)
+            print(f"   ... {done}/{len(hospital_list)} RS")
+
+        if empty_count:
+            print(f"   ({empty_count} RS tidak memiliki data tempat tidur)")
+
+    print(f" -> {len(all_data)} baris dari {len(hospital_list)} RS.\nPush ke Power BI...")
 
     batch_size = 10000
     batches = [json.dumps(all_data[i:i+batch_size]).encode() for i in range(0, len(all_data), batch_size)]
