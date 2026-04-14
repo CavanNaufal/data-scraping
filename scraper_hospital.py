@@ -82,15 +82,6 @@ def write_csv(all_data: list[dict]):
         csv.DictWriter(f, fieldnames=_FIELDS).writeheader()
         csv.DictWriter(f, fieldnames=_FIELDS).writerows(all_data)
 
-async def _fetch_with_retry(session, url, timeout=15, retries=1):
-    for attempt in range(retries + 1):
-        try:
-            return await session.get(url, timeout=timeout)
-        except Exception:
-            if attempt == retries:
-                return None
-            await asyncio.sleep(0.3)
-
 async def run():
     if not POWER_BI_URL:
         print("Error: POWER_BI_URL tidak ditemukan.")
@@ -98,39 +89,49 @@ async def run():
     total_start = time.perf_counter()
     wib_now = datetime.now(timezone(timedelta(hours=7))).strftime('%Y-%m-%dT%H:%M:%S.000Z')
 
-    all_data = []
-    lock = asyncio.Lock()
-    progress = [0]
-    total_hospitals = [0]
+    sem = asyncio.Semaphore(150)
+    hosp_tasks: list[asyncio.Task] = []
 
-    async with AsyncSession(impersonate="chrome120", max_clients=100) as session:
-        sem = asyncio.Semaphore(80)
+    async with AsyncSession(impersonate="chrome120", max_clients=200) as session:
 
-        async def fetch_hosp(hosp: dict):
+        async def fetch_hosp(hosp: dict) -> list[dict]:
             async with sem:
-                r = await _fetch_with_retry(session, HOSPITAL_URL.format(hosp['kode_rs'], hosp['prop_code']))
-                if not r:
-                    return
-                data = parse_hospital_detail(r.text, hosp['Province'], hosp['Hospital Name'], wib_now)
-                async with lock:
-                    all_data.extend(data)
-                    progress[0] += 1
-                    if progress[0] % 500 == 0:
-                        print(f"    ... {progress[0]}/{total_hospitals[0]} RS")
+                for attempt in range(2):
+                    try:
+                        r = await session.get(
+                            HOSPITAL_URL.format(hosp['kode_rs'], hosp['prop_code']),
+                            timeout=12,
+                        )
+                        return parse_hospital_detail(r.text, hosp['Province'], hosp['Hospital Name'], wib_now)
+                    except Exception:
+                        if attempt == 1:
+                            return []
 
-        async def fetch_province_and_hospitals(code: int):
-            r = await _fetch_with_retry(session, PROVINCE_URL.format(code))
-            if not r:
-                return
-            hospitals = extract_hospital_codes(r.text, str(code))
-            async with lock:
-                total_hospitals[0] += len(hospitals)
-            await asyncio.gather(*[fetch_hosp(h) for h in hospitals])
+        async def fetch_province(code: int):
+            for attempt in range(2):
+                try:
+                    r = await session.get(PROVINCE_URL.format(code), timeout=12)
+                    hospitals = extract_hospital_codes(r.text, str(code))
+                    for h in hospitals:
+                        hosp_tasks.append(asyncio.create_task(fetch_hosp(h)))
+                    return
+                except Exception:
+                    if attempt == 1:
+                        return
 
         print("Scraping semua provinsi + detail RS (pipeline)...")
-        await asyncio.gather(*[fetch_province_and_hospitals(c) for c in PROVINCE_CODES])
+        await asyncio.gather(*[fetch_province(c) for c in PROVINCE_CODES])
+        print(f" -> {len(hosp_tasks)} RS ditemukan, mengambil detail...")
+        results = await asyncio.gather(*hosp_tasks)
 
-    print(f" -> {len(all_data)} baris dari {progress[0]} RS.\nPush ke Power BI...")
+    all_data = []
+    done = 0
+    for res in results:
+        if res:
+            all_data.extend(res)
+            done += 1
+    print(f" -> {len(all_data)} baris dari {done} RS.\nPush ke Power BI...")
+
     batch_size = 10000
     batches = [json.dumps(all_data[i:i+batch_size]).encode() for i in range(0, len(all_data), batch_size)]
     csv_future = asyncio.get_running_loop().run_in_executor(None, write_csv, all_data)
