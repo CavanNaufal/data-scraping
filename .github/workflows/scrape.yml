@@ -1,15 +1,16 @@
 name: Automated Siranap Scraper
 
 on:
-  schedule:
-     - cron: '0 */4 * * *'
+   #schedule:
+    # - cron: '0 * * * *'
   workflow_dispatch:
 
 permissions:
   contents: write
 
 env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Anda bisa membiarkan atau menghapus FORCE_JAVASCRIPT ini, tidak masalah
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true 
   UV_CACHE_DIR: /tmp/uv-cache
 
 jobs:
@@ -27,7 +28,8 @@ jobs:
 
       - name: Install & Run Scraper
         env:
-          POWER_BI_URL: ${{secrets.POWER_BI_URL}}
+          # --- INI YANG BERUBAH ---
+          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
         run: |
           uv venv .venv
           source .venv/bin/activate
