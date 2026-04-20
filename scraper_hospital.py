@@ -8,16 +8,17 @@ from curl_cffi.requests import AsyncSession
 from selectolax.parser import HTMLParser
 from datetime import datetime, timedelta, timezone
 
-# --- IMPORT BARU UNTUK BIGQUERY ---
+# --- IMPORT UNTUK GOOGLE BIGQUERY ---
 from google.oauth2 import service_account
 from google.cloud import bigquery
 
 _NUMBER_RE = re.compile(r'\d+')
 
+# Kolom sudah distandarisasi (Tanpa spasi & simbol) untuk BigQuery
 _FIELDS = [
-    'Province', 'Hospital Name', 'Class', 
-    'Total Beds', 'Available Beds', 'Occupied Beds', 'BOR (%)', 
-    'Sent Date'
+    'Province', 'Hospital_Name', 'Class', 
+    'Total_Beds', 'Available_Beds', 'Occupied_Beds', 'BOR_Percentage', 
+    'Sent_Date'
 ]
 
 PROVINCE_CODES = [
@@ -48,7 +49,7 @@ def extract_hospital_codes(html: str, prop_code: str) -> list[dict]:
                 'kode_rs': m.group(1),
                 'prop_code': f"{prop_code}prop",
                 'Province': prov_name,
-                'Hospital Name': hosp_name
+                'Hospital_Name': hosp_name
             })
     return hospitals
 
@@ -72,9 +73,9 @@ def parse_hospital_detail(html: str, prov_name: str, hosp_name: str, wib_now: st
                 bor = round((occupied / total) * 100, 2) if total > 0 and occupied >= 0 else 0.0
                 
                 local_data.append({
-                    'Province': prov_name, 'Hospital Name': hosp_name, 'Class': class_name,
-                    'Total Beds': total, 'Available Beds': avail, 'Occupied Beds': max(0, occupied),
-                    'BOR (%)': bor, 'Sent Date': wib_now
+                    'Province': prov_name, 'Hospital_Name': hosp_name, 'Class': class_name,
+                    'Total_Beds': total, 'Available_Beds': avail, 'Occupied_Beds': max(0, occupied),
+                    'BOR_Percentage': bor, 'Sent_Date': wib_now
                 })
             except: pass
     return local_data
@@ -126,7 +127,7 @@ async def run():
             r = await _fetch(session, sem, HOSPITAL_URL.format(hosp['kode_rs'], hosp['prop_code']))
             if not r:
                 return hosp, None
-            return hosp, parse_hospital_detail(r.text, hosp['Province'], hosp['Hospital Name'], wib_now)
+            return hosp, parse_hospital_detail(r.text, hosp['Province'], hosp['Hospital_Name'], wib_now)
 
         async def fetch_province(code: int):
             r = await _fetch(session, sem, PROVINCE_URL.format(code))
@@ -195,12 +196,16 @@ async def run():
         print(f"   ... {done}/{total_hosps[0]} RS berhasil")
         if failed_hosps:
             print(f"   PERINGATAN: {len(failed_hosps)} RS gagal setelah {MAX_ROUNDS} ronde")
+            for h in failed_hosps[:10]:
+                print(f"     - {h['Hospital_Name']} ({h['kode_rs']})")
+            if len(failed_hosps) > 10:
+                print(f"     ... dan {len(failed_hosps) - 10} lainnya")
         if empty_count:
             print(f"   ({empty_count} RS tidak memiliki data tempat tidur)")
 
     print(f" -> {len(all_data)} baris dari {total_hosps[0]} RS.\nMenyimpan ke CSV dan Load ke BigQuery...")
 
-    # 1. Simpan CSV lokal (untuk arsip snapshot)
+    # 1. Simpan CSV lokal (sebagai cadangan di GitHub)
     csv_future = asyncio.get_running_loop().run_in_executor(None, write_csv, all_data)
     await csv_future
 
