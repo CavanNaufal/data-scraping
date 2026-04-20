@@ -1,2 +1,3 @@
 curl-cffi
 selectolax
+google-cloud-bigquery==3.17.2
