@@ -8,6 +8,10 @@ from curl_cffi.requests import AsyncSession
 from selectolax.parser import HTMLParser
 from datetime import datetime, timedelta, timezone
 
+# --- IMPORT BARU UNTUK BIGQUERY ---
+from google.oauth2 import service_account
+from google.cloud import bigquery
+
 _NUMBER_RE = re.compile(r'\d+')
 
 _FIELDS = [
@@ -28,8 +32,6 @@ PROVINCE_CODES = [
 
 PROVINCE_URL = 'https://keslan.kemkes.go.id/app/siranap/rumah_sakit?jenis=2&propinsi={}prop&kabkota='
 HOSPITAL_URL = 'https://keslan.kemkes.go.id/app/siranap/tempat_tidur?kode_rs={}&jenis=2&propinsi={}&kabkota='
-
-POWER_BI_URL = os.environ.get("POWER_BI_URL")
 
 def extract_hospital_codes(html: str, prop_code: str) -> list[dict]:
     tree = HTMLParser(html)
@@ -105,9 +107,12 @@ async def _fetch(session, sem, url, timeout=15):
     return None
 
 async def run():
-    if not POWER_BI_URL:
-        print("Error: POWER_BI_URL tidak ditemukan.")
+    # --- CEK KUNCI RAHASIA GCP ---
+    gcp_json_str = os.environ.get("GCP_CREDENTIALS")
+    if not gcp_json_str:
+        print("Error: Variabel environment GCP_CREDENTIALS tidak ditemukan.")
         return
+
     total_start = time.perf_counter()
     wib_now = datetime.now(timezone(timedelta(hours=7))).strftime('%Y-%m-%dT%H:%M:%S.000Z')
 
@@ -133,7 +138,6 @@ async def run():
                 all_results.append(asyncio.create_task(fetch_hosp(h)))
             return code, hospitals
 
-        # -- Fase 1+2 pipeline: provinsi langsung spawn task RS --
         t0 = time.perf_counter()
         print("Scraping provinsi + detail RS (pipeline)...")
         prov_remaining = list(PROVINCE_CODES)
@@ -153,11 +157,9 @@ async def run():
         t1 = time.perf_counter()
         print(f"   -> {len(PROVINCE_CODES) - len(prov_skipped)}/{len(PROVINCE_CODES)} provinsi, {total_hosps[0]} RS [{t1-t0:.1f}s]. Menunggu detail...")
 
-        # -- Tunggu semua task RS selesai --
         hosp_results = await asyncio.gather(*all_results)
         t2 = time.perf_counter()
 
-        # -- Pisahkan hasil --
         all_data = []
         empty_count = 0
         failed_hosps = []
@@ -170,7 +172,6 @@ async def run():
                 empty_count += 1
         print(f"   Pass pertama: {total_hosps[0]-len(failed_hosps)} OK, {len(failed_hosps)} gagal [{t2-t1:.1f}s]")
 
-        # -- Retry RS yang gagal --
         for ronde in range(2, MAX_ROUNDS + 1):
             if not failed_hosps:
                 break
@@ -194,26 +195,38 @@ async def run():
         print(f"   ... {done}/{total_hosps[0]} RS berhasil")
         if failed_hosps:
             print(f"   PERINGATAN: {len(failed_hosps)} RS gagal setelah {MAX_ROUNDS} ronde")
-            for h in failed_hosps[:10]:
-                print(f"     - {h['Hospital Name']} ({h['kode_rs']})")
-            if len(failed_hosps) > 10:
-                print(f"     ... dan {len(failed_hosps) - 10} lainnya")
         if empty_count:
             print(f"   ({empty_count} RS tidak memiliki data tempat tidur)")
 
-    print(f" -> {len(all_data)} baris dari {total_hosps[0]} RS.\nPush ke Power BI...")
+    print(f" -> {len(all_data)} baris dari {total_hosps[0]} RS.\nMenyimpan ke CSV dan Load ke BigQuery...")
 
-    batch_size = 10000
-    batches = [json.dumps(all_data[i:i+batch_size]).encode() for i in range(0, len(all_data), batch_size)]
+    # 1. Simpan CSV lokal (untuk arsip snapshot)
     csv_future = asyncio.get_running_loop().run_in_executor(None, write_csv, all_data)
-    async with AsyncSession(impersonate="chrome120", max_clients=5) as pbi:
-        responses = await asyncio.gather(*[pbi.post(POWER_BI_URL, data=b, headers={"Content-Type":"application/json"}, timeout=40) for b in batches])
-        for i, r in enumerate(responses, 1):
-            if r.status_code == 200:
-                print(f"   Batch {i}/{len(batches)} OK")
-            else:
-                print(f"   GAGAL batch {i}/{len(batches)}: HTTP {r.status_code} - {r.text[:200]}")
     await csv_future
+
+    # 2. Load ke Google BigQuery
+    try:
+        gcp_info = json.loads(gcp_json_str)
+        credentials = service_account.Credentials.from_service_account_info(gcp_info)
+        client = bigquery.Client(credentials=credentials, project=credentials.project_id)
+        
+        # Format tabel: "project_id.dataset_id.table_id"
+        table_id = f"{credentials.project_id}.siranap_db.bed_capacity"
+        
+        job_config = bigquery.LoadJobConfig(
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND, # Mode tambah data (tidak menimpa)
+            autodetect=True, # Biarkan BigQuery mendeteksi tipe kolom otomatis
+        )
+        
+        bq_start = time.perf_counter()
+        job = client.load_table_from_json(all_data, table_id, job_config=job_config)
+        job.result() # Tunggu hingga selesai
+        
+        print(f"✅ BERHASIL: {job.output_rows} baris masuk ke tabel BigQuery {table_id}.")
+        print(f"   Waktu load BQ: {time.perf_counter() - bq_start:.1f}s")
+    except Exception as e:
+        print(f"❌ GAGAL load ke BigQuery: {e}")
+
     print(f"TOTAL RUNTIME: {time.perf_counter() - total_start:.1f}s")
 
 if __name__ == "__main__":
