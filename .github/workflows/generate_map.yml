@@ -38,5 +38,5 @@ jobs:
         run: |
           git config --global user.name "GitHub Action Bot"
           git config --global user.email "action@github.com"
-          git add hospital_map.html
+          git add hospital_volume_map.html
           git diff --cached --quiet && echo "Peta tidak ada perubahan" || git commit -m "Auto-update Leaflet Map" && git push
