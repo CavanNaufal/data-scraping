@@ -1,0 +1,42 @@
+name: Generate Siranap Leaflet Map
+
+on:
+  #schedule:
+    # Berjalan setiap 4 jam pada menit ke-15 (Memberi jeda agar scraper selesai duluan)
+    #- cron: '15 */4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  UV_CACHE_DIR: /tmp/uv-cache
+
+jobs:
+  build-map:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install Dependencies & Generate Map
+        env:
+          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+        run: |
+          uv venv .venv
+          source .venv/bin/activate
+          # Menginstal library khusus untuk peta tanpa mengganggu requirements.txt utama
+          uv pip install folium pandas db-dtypes google-cloud-bigquery
+          python -u generate_map.py
+
+      - name: Save HTML Map to GitHub
+        run: |
+          git config --global user.name "GitHub Action Bot"
+          git config --global user.email "action@github.com"
+          git add hospital_map.html
+          git diff --cached --quiet && echo "Peta tidak ada perubahan" || git commit -m "Auto-update Leaflet Map" && git push
