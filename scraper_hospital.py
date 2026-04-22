@@ -14,9 +14,9 @@ from google.cloud import bigquery
 
 _NUMBER_RE = re.compile(r'\d+')
 
-# Kolom sudah distandarisasi (Tanpa spasi & simbol) untuk BigQuery
+# UBAH DI SINI: Kode_RS sekarang berada setelah Province
 _FIELDS = [
-    'Province', 'Hospital_Name', 'Class', 
+    'Province', 'Kode_RS', 'Hospital_Name', 'Class', 
     'Total_Beds', 'Available_Beds', 'Occupied_Beds', 'BOR_Percentage', 
     'Sent_Date'
 ]
@@ -53,7 +53,7 @@ def extract_hospital_codes(html: str, prop_code: str) -> list[dict]:
             })
     return hospitals
 
-def parse_hospital_detail(html: str, prov_name: str, hosp_name: str, wib_now: str) -> list[dict]:
+def parse_hospital_detail(html: str, prov_name: str, hosp_name: str, wib_now: str, kode_rs: str) -> list[dict]:
     tree = HTMLParser(html)
     local_data = []
     for card in tree.css('div.card'):
@@ -72,8 +72,9 @@ def parse_hospital_detail(html: str, prov_name: str, hosp_name: str, wib_now: st
                 occupied = total - avail
                 bor = round((occupied / total) * 100, 2) if total > 0 and occupied >= 0 else 0.0
                 
+                # UBAH DI SINI: Kode_RS disisipkan setelah Province
                 local_data.append({
-                    'Province': prov_name, 'Hospital_Name': hosp_name, 'Class': class_name,
+                    'Province': prov_name, 'Kode_RS': kode_rs, 'Hospital_Name': hosp_name, 'Class': class_name,
                     'Total_Beds': total, 'Available_Beds': avail, 'Occupied_Beds': max(0, occupied),
                     'BOR_Percentage': bor, 'Sent_Date': wib_now
                 })
@@ -108,7 +109,6 @@ async def _fetch(session, sem, url, timeout=15):
     return None
 
 async def run():
-    # --- CEK KUNCI RAHASIA GCP ---
     gcp_json_str = os.environ.get("GCP_CREDENTIALS")
     if not gcp_json_str:
         print("Error: Variabel environment GCP_CREDENTIALS tidak ditemukan.")
@@ -127,7 +127,7 @@ async def run():
             r = await _fetch(session, sem, HOSPITAL_URL.format(hosp['kode_rs'], hosp['prop_code']))
             if not r:
                 return hosp, None
-            return hosp, parse_hospital_detail(r.text, hosp['Province'], hosp['Hospital_Name'], wib_now)
+            return hosp, parse_hospital_detail(r.text, hosp['Province'], hosp['Hospital_Name'], wib_now, hosp['kode_rs'])
 
         async def fetch_province(code: int):
             r = await _fetch(session, sem, PROVINCE_URL.format(code))
@@ -205,27 +205,25 @@ async def run():
 
     print(f" -> {len(all_data)} baris dari {total_hosps[0]} RS.\nMenyimpan ke CSV dan Load ke BigQuery...")
 
-    # 1. Simpan CSV lokal (sebagai cadangan di GitHub)
     csv_future = asyncio.get_running_loop().run_in_executor(None, write_csv, all_data)
     await csv_future
 
-    # 2. Load ke Google BigQuery
     try:
         gcp_info = json.loads(gcp_json_str)
         credentials = service_account.Credentials.from_service_account_info(gcp_info)
         client = bigquery.Client(credentials=credentials, project=credentials.project_id)
         
-        # Format tabel: "project_id.dataset_id.table_id"
         table_id = f"{credentials.project_id}.siranap_db.bed_capacity"
         
         job_config = bigquery.LoadJobConfig(
-            write_disposition=bigquery.WriteDisposition.WRITE_APPEND, # Mode tambah data (tidak menimpa)
-            autodetect=True, # Biarkan BigQuery mendeteksi tipe kolom otomatis
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+            autodetect=True, 
+            schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION]
         )
         
         bq_start = time.perf_counter()
         job = client.load_table_from_json(all_data, table_id, job_config=job_config)
-        job.result() # Tunggu hingga selesai
+        job.result() 
         
         print(f"✅ BERHASIL: {job.output_rows} baris masuk ke tabel BigQuery {table_id}.")
         print(f"   Waktu load BQ: {time.perf_counter() - bq_start:.1f}s")
