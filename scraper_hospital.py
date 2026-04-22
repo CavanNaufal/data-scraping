@@ -26,13 +26,14 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-CONCURRENCY_LIMIT = 100
-MAX_HTTP_CLIENTS = 120
-REQUEST_TIMEOUT = 15
+CONCURRENCY_LIMIT = 30
+MAX_HTTP_CLIENTS = 50
+REQUEST_TIMEOUT = 20
 RETRY_REQUEST_TIMEOUT = 30
 MAX_FETCH_ATTEMPTS = 3
 MAX_RETRY_ROUNDS = 10
-BACKOFF_CAP = 30.0
+BACKOFF_CAP = 10.0
+PROVINCE_BATCH_SIZE = 10
 
 BQ_DATASET = "siranap_db"
 BQ_TABLE = "bed_capacity"
@@ -74,15 +75,15 @@ _NUMBER_RE = re.compile(r"\d+")
 
 
 def _backoff_delay(round_num: int) -> float:
-    """Exponential backoff: 1s, 2s, 4s, 8s, ... capped at BACKOFF_CAP."""
+    """Exponential backoff: 1s, 2s, 4s, ... capped at BACKOFF_CAP."""
     return min(2 ** (round_num - 2), BACKOFF_CAP)
 
 
 def _retry_concurrency(round_num: int) -> int:
     """Lower concurrency on later retry rounds to reduce server load."""
     if round_num <= 3:
-        return 50
-    return 20
+        return 20
+    return 10
 
 # ---------------------------------------------------------------------------
 # HTML Parsing
@@ -223,30 +224,41 @@ async def scrape_all(sent_date: str) -> tuple[list[dict], int, list[dict]]:
                 detail_tasks.append(asyncio.create_task(fetch_hospital_detail(h)))
             return code, hospitals
 
-        # === Phase 1: Fetch province listings with retries ===
+        # === Phase 1: Fetch province listings in batches with retries ===
         t0 = time.perf_counter()
-        logger.info("Scraping province listings + hospital details (pipeline)...")
+        logger.info("Scraping province listings in batches of %d...", PROVINCE_BATCH_SIZE)
 
         remaining_provinces = list(PROVINCE_CODES)
-        for round_num in range(1, MAX_RETRY_ROUNDS + 1):
+
+        # First pass: batch provinces to avoid overwhelming the server
+        first_pass_failed: list[int] = []
+        for i in range(0, len(remaining_provinces), PROVINCE_BATCH_SIZE):
+            batch = remaining_provinces[i:i + PROVINCE_BATCH_SIZE]
+            results = await asyncio.gather(*[fetch_province(c) for c in batch])
+            first_pass_failed.extend(code for code, hosps in results if hosps is None)
+            if i + PROVINCE_BATCH_SIZE < len(remaining_provinces):
+                await asyncio.sleep(0.5)
+
+        remaining_provinces = first_pass_failed
+        if remaining_provinces:
+            logger.info("First pass: %d provinces failed, starting retries...", len(remaining_provinces))
+
+        # Retry rounds with backoff
+        for round_num in range(2, MAX_RETRY_ROUNDS + 1):
             if not remaining_provinces:
                 break
-            if round_num > 1:
-                delay = _backoff_delay(round_num)
-                concurrency = _retry_concurrency(round_num)
-                retry_sem = asyncio.Semaphore(concurrency)
-                logger.info(
-                    "Retrying %d provinces (round %d, delay %.0fs, concurrency %d)...",
-                    len(remaining_provinces), round_num, delay, concurrency,
-                )
-                await asyncio.sleep(delay)
-                results = await asyncio.gather(*[
-                    fetch_province(c, use_sem=retry_sem, timeout=RETRY_REQUEST_TIMEOUT)
-                    for c in remaining_provinces
-                ])
-            else:
-                results = await asyncio.gather(*[fetch_province(c) for c in remaining_provinces])
-
+            delay = _backoff_delay(round_num)
+            concurrency = _retry_concurrency(round_num)
+            retry_sem = asyncio.Semaphore(concurrency)
+            logger.info(
+                "Retrying %d provinces (round %d, delay %.0fs, concurrency %d)...",
+                len(remaining_provinces), round_num, delay, concurrency,
+            )
+            await asyncio.sleep(delay)
+            results = await asyncio.gather(*[
+                fetch_province(c, use_sem=retry_sem, timeout=RETRY_REQUEST_TIMEOUT)
+                for c in remaining_provinces
+            ])
             remaining_provinces = [code for code, hosps in results if hosps is None]
 
         skipped_provinces = remaining_provinces
