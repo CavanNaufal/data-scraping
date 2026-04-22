@@ -194,30 +194,28 @@ def today_already_scraped(client: bigquery.Client, table_id: str, today_wib: str
 BASELINE_TOLERANCE = 0.95
 
 def get_baseline_hospital_count(client: bigquery.Client, table_id: str) -> int | None:
-    """Get the number of unique hospitals from the most recent scrape that has Kode_RS."""
+    """Get the number of unique hospitals from the most recent scrape."""
     query = f"""
         WITH latest AS (
             SELECT DATE(Sent_Date) as scrape_date
             FROM `{table_id}`
-            WHERE Kode_RS IS NOT NULL
             ORDER BY Sent_Date DESC
             LIMIT 1
         )
         SELECT
             (SELECT scrape_date FROM latest) as scrape_date,
-            COUNT(DISTINCT Kode_RS) as hospital_count
+            COUNT(DISTINCT CONCAT(Province, '||', Hospital_Name)) as hospital_count
         FROM `{table_id}`
         WHERE DATE(Sent_Date) = (SELECT scrape_date FROM latest)
-          AND Kode_RS IS NOT NULL
     """
     try:
         result = list(client.query(query).result())
         if not result or not result[0].hospital_count:
-            logger.info("No baseline with Kode_RS found — skipping baseline check")
+            logger.info("No baseline found — skipping baseline check")
             return None
         count = result[0].hospital_count
         scrape_date = result[0].scrape_date
-        logger.info("Baseline from %s: %d unique hospitals (by Kode_RS)", scrape_date, count)
+        logger.info("Baseline from %s: %d unique hospitals", scrape_date, count)
         return count
     except Exception as e:
         logger.warning("Could not get baseline hospital count: %s", e)
