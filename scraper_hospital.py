@@ -1,24 +1,47 @@
 import asyncio
 import csv
-import re
-import time
 import json
+import logging
 import os
-from curl_cffi.requests import AsyncSession
-from selectolax.parser import HTMLParser
+import re
+import sys
+import time
 from datetime import datetime, timedelta, timezone
 
-# --- IMPORT UNTUK GOOGLE BIGQUERY ---
-from google.oauth2 import service_account
+from curl_cffi.requests import AsyncSession
 from google.cloud import bigquery
+from google.oauth2 import service_account
+from selectolax.parser import HTMLParser
 
-_NUMBER_RE = re.compile(r'\d+')
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
-# UBAH DI SINI: Kode_RS sekarang berada setelah Province
-_FIELDS = [
-    'Province', 'Kode_RS', 'Hospital_Name', 'Class', 
-    'Total_Beds', 'Available_Beds', 'Occupied_Beds', 'BOR_Percentage', 
-    'Sent_Date'
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+CONCURRENCY_LIMIT = 100
+MAX_HTTP_CLIENTS = 120
+REQUEST_TIMEOUT = 15
+MAX_RETRY_ROUNDS = 5
+RETRY_DELAY_PROVINCE = 1.0
+RETRY_DELAY_HOSPITAL = 0.5
+FETCH_RETRY_DELAY = 0.3
+
+BQ_DATASET = "siranap_db"
+BQ_TABLE = "bed_capacity"
+CSV_OUTPUT = "siranap_data.csv"
+
+FIELDS = [
+    "Province", "Kode_RS", "Hospital_Name", "Class",
+    "Total_Beds", "Available_Beds", "Occupied_Beds", "BOR_Percentage",
+    "Sent_Date",
 ]
 
 PROVINCE_CODES = [
@@ -28,159 +51,198 @@ PROVINCE_CODES = [
     61, 62, 63, 64, 65,
     71, 72, 73, 74, 75, 76,
     81, 82,
-    91, 92, 93, 94, 95, 96, 97
+    91, 92, 93, 94, 95, 96, 97,
 ]
 
-PROVINCE_URL = 'https://keslan.kemkes.go.id/app/siranap/rumah_sakit?jenis=2&propinsi={}prop&kabkota='
-HOSPITAL_URL = 'https://keslan.kemkes.go.id/app/siranap/tempat_tidur?kode_rs={}&jenis=2&propinsi={}&kabkota='
+PROVINCE_URL = (
+    "https://keslan.kemkes.go.id/app/siranap/rumah_sakit"
+    "?jenis=2&propinsi={}prop&kabkota="
+)
+HOSPITAL_URL = (
+    "https://keslan.kemkes.go.id/app/siranap/tempat_tidur"
+    "?kode_rs={}&jenis=2&propinsi={}&kabkota="
+)
 
-def extract_hospital_codes(html: str, prop_code: str) -> list[dict]:
-    tree = HTMLParser(html)
-    hospitals = []
-    opt = tree.css_first(f'option[value="{prop_code}prop"]')
-    prov_name = opt.text(strip=True) if opt else f"Code {prop_code}"
-        
-    for card in tree.css('div.cardRS'):
-        h5 = card.css_first('h5')
-        hosp_name = h5.text(strip=True) if h5 else "-"
-        m = re.search(r'kode_rs=([A-Za-z0-9]+)', card.html)
-        if m:
-            hospitals.append({
-                'kode_rs': m.group(1),
-                'prop_code': f"{prop_code}prop",
-                'Province': prov_name,
-                'Hospital_Name': hosp_name
-            })
-    return hospitals
-
-def parse_hospital_detail(html: str, prov_name: str, hosp_name: str, wib_now: str, kode_rs: str) -> list[dict]:
-    tree = HTMLParser(html)
-    local_data = []
-    for card in tree.css('div.card'):
-        header = card.css_first('p.mb-0')
-        if not header: continue
-        class_name = header.text(deep=False, strip=True)
-        if not class_name: class_name = header.text(strip=True).split('Update')[0].strip()
-        
-        number_divs = card.css('div[style*="font-size:20px"]')
-        if len(number_divs) >= 2:
-            try:
-                t_val = _NUMBER_RE.search(number_divs[0].text(strip=True))
-                a_val = _NUMBER_RE.search(number_divs[1].text(strip=True))
-                total = int(t_val.group()) if t_val else 0
-                avail = int(a_val.group()) if a_val else 0
-                occupied = total - avail
-                bor = round((occupied / total) * 100, 2) if total > 0 and occupied >= 0 else 0.0
-                
-                # UBAH DI SINI: Kode_RS disisipkan setelah Province
-                local_data.append({
-                    'Province': prov_name, 'Kode_RS': kode_rs, 'Hospital_Name': hosp_name, 'Class': class_name,
-                    'Total_Beds': total, 'Available_Beds': avail, 'Occupied_Beds': max(0, occupied),
-                    'BOR_Percentage': bor, 'Sent_Date': wib_now
-                })
-            except: pass
-    return local_data
-
-def write_csv(all_data: list[dict]):
-    with open('siranap_data.csv', 'w', newline='', encoding='utf-8') as f:
-        csv.DictWriter(f, fieldnames=_FIELDS).writeheader()
-        csv.DictWriter(f, fieldnames=_FIELDS).writerows(all_data)
-
-MAX_ROUNDS = 5
-
-_HEADERS = {
+_HTTP_HEADERS = {
     "Accept": "text/html",
     "Accept-Encoding": "gzip, deflate, br",
     "Accept-Language": "id-ID,id;q=0.9",
     "Connection": "keep-alive",
 }
 
-async def _fetch(session, sem, url, timeout=15):
+_NUMBER_RE = re.compile(r"\d+")
+
+# ---------------------------------------------------------------------------
+# HTML Parsing
+# ---------------------------------------------------------------------------
+
+def extract_hospital_codes(html: str, prop_code: str) -> list[dict]:
+    """Parse province listing page and return hospital metadata."""
+    tree = HTMLParser(html)
+    opt = tree.css_first(f'option[value="{prop_code}prop"]')
+    prov_name = opt.text(strip=True) if opt else f"Code {prop_code}"
+
+    hospitals: list[dict] = []
+    for card in tree.css("div.cardRS"):
+        h5 = card.css_first("h5")
+        hosp_name = h5.text(strip=True) if h5 else "-"
+        match = re.search(r"kode_rs=([A-Za-z0-9]+)", card.html)
+        if match:
+            hospitals.append({
+                "kode_rs": match.group(1),
+                "prop_code": f"{prop_code}prop",
+                "Province": prov_name,
+                "Hospital_Name": hosp_name,
+            })
+    return hospitals
+
+
+def parse_hospital_detail(
+    html: str,
+    prov_name: str,
+    hosp_name: str,
+    sent_date: str,
+    kode_rs: str,
+) -> list[dict]:
+    """Parse hospital detail page and return bed-capacity rows."""
+    tree = HTMLParser(html)
+    rows: list[dict] = []
+
+    for card in tree.css("div.card"):
+        header = card.css_first("p.mb-0")
+        if not header:
+            continue
+
+        class_name = header.text(deep=False, strip=True)
+        if not class_name:
+            class_name = header.text(strip=True).split("Update")[0].strip()
+
+        number_divs = card.css('div[style*="font-size:20px"]')
+        if len(number_divs) < 2:
+            continue
+
+        try:
+            t_val = _NUMBER_RE.search(number_divs[0].text(strip=True))
+            a_val = _NUMBER_RE.search(number_divs[1].text(strip=True))
+            total = int(t_val.group()) if t_val else 0
+            avail = int(a_val.group()) if a_val else 0
+            occupied = total - avail
+            bor = round((occupied / total) * 100, 2) if total > 0 and occupied >= 0 else 0.0
+
+            rows.append({
+                "Province": prov_name,
+                "Kode_RS": kode_rs,
+                "Hospital_Name": hosp_name,
+                "Class": class_name,
+                "Total_Beds": total,
+                "Available_Beds": avail,
+                "Occupied_Beds": max(0, occupied),
+                "BOR_Percentage": bor,
+                "Sent_Date": sent_date,
+            })
+        except Exception as e:
+            logger.warning("Parse error for %s (%s), class '%s': %s", hosp_name, kode_rs, class_name, e)
+
+    return rows
+
+# ---------------------------------------------------------------------------
+# HTTP Fetching
+# ---------------------------------------------------------------------------
+
+async def _fetch(session: AsyncSession, sem: asyncio.Semaphore, url: str) -> object | None:
+    """Fetch a URL with one retry. Returns response or None on failure."""
     for attempt in range(2):
         async with sem:
             try:
-                r = await session.get(url, headers=_HEADERS, timeout=timeout)
-                if r.status_code == 200:
-                    return r
+                resp = await session.get(url, headers=_HTTP_HEADERS, timeout=REQUEST_TIMEOUT)
+                if resp.status_code == 200:
+                    return resp
             except Exception:
                 pass
         if attempt == 0:
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(FETCH_RETRY_DELAY)
     return None
 
-async def run():
-    gcp_json_str = os.environ.get("GCP_CREDENTIALS")
-    if not gcp_json_str:
-        print("Error: Variabel environment GCP_CREDENTIALS tidak ditemukan.")
-        return
+# ---------------------------------------------------------------------------
+# Scraping orchestration
+# ---------------------------------------------------------------------------
 
-    total_start = time.perf_counter()
-    wib_now = datetime.now(timezone(timedelta(hours=7))).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+async def scrape_all(sent_date: str) -> tuple[list[dict], int]:
+    """Scrape all provinces and hospitals. Returns (rows, total_hospital_count)."""
+    sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
+    detail_tasks: list[asyncio.Task] = []
+    total_hospitals = 0
 
-    sem = asyncio.Semaphore(100)
-    all_results: list[asyncio.Task] = []
-    total_hosps = [0]
+    async with AsyncSession(impersonate="chrome120", max_clients=MAX_HTTP_CLIENTS) as session:
 
-    async with AsyncSession(impersonate="chrome120", max_clients=120) as session:
-
-        async def fetch_hosp(hosp: dict) -> tuple[dict, list | None]:
-            r = await _fetch(session, sem, HOSPITAL_URL.format(hosp['kode_rs'], hosp['prop_code']))
-            if not r:
+        async def fetch_hospital_detail(hosp: dict) -> tuple[dict, list | None]:
+            resp = await _fetch(session, sem, HOSPITAL_URL.format(hosp["kode_rs"], hosp["prop_code"]))
+            if not resp:
                 return hosp, None
-            return hosp, parse_hospital_detail(r.text, hosp['Province'], hosp['Hospital_Name'], wib_now, hosp['kode_rs'])
+            return hosp, parse_hospital_detail(resp.text, hosp["Province"], hosp["Hospital_Name"], sent_date, hosp["kode_rs"])
 
-        async def fetch_province(code: int):
-            r = await _fetch(session, sem, PROVINCE_URL.format(code))
-            if not r:
+        async def fetch_province(code: int) -> tuple[int, list | None]:
+            resp = await _fetch(session, sem, PROVINCE_URL.format(code))
+            if not resp:
                 return code, None
-            hospitals = extract_hospital_codes(r.text, str(code))
-            total_hosps[0] += len(hospitals)
+            hospitals = extract_hospital_codes(resp.text, str(code))
+            nonlocal total_hospitals
+            total_hospitals += len(hospitals)
             for h in hospitals:
-                all_results.append(asyncio.create_task(fetch_hosp(h)))
+                detail_tasks.append(asyncio.create_task(fetch_hospital_detail(h)))
             return code, hospitals
 
+        # --- Phase 1: Fetch province listings with retries ---
         t0 = time.perf_counter()
-        print("Scraping provinsi + detail RS (pipeline)...")
-        prov_remaining = list(PROVINCE_CODES)
-        prov_skipped = []
-        for ronde in range(1, MAX_ROUNDS + 1):
-            if not prov_remaining:
+        logger.info("Scraping province listings + hospital details (pipeline)...")
+
+        remaining_provinces = list(PROVINCE_CODES)
+        for round_num in range(1, MAX_RETRY_ROUNDS + 1):
+            if not remaining_provinces:
                 break
-            if ronde > 1:
-                print(f"   Retry {len(prov_remaining)} provinsi (ronde {ronde})...")
-                await asyncio.sleep(1.0)
-            results = await asyncio.gather(*[fetch_province(c) for c in prov_remaining])
-            prov_remaining = [code for code, hosps in results if hosps is None]
+            if round_num > 1:
+                logger.info("Retrying %d provinces (round %d)...", len(remaining_provinces), round_num)
+                await asyncio.sleep(RETRY_DELAY_PROVINCE)
 
-        if prov_remaining:
-            prov_skipped = prov_remaining
-            print(f"   PERINGATAN: {len(prov_skipped)} provinsi gagal: {prov_skipped}")
+            results = await asyncio.gather(*[fetch_province(c) for c in remaining_provinces])
+            remaining_provinces = [code for code, hosps in results if hosps is None]
+
+        skipped_provinces = remaining_provinces
+        if skipped_provinces:
+            logger.warning("%d provinces failed after %d rounds: %s", len(skipped_provinces), MAX_RETRY_ROUNDS, skipped_provinces)
+
         t1 = time.perf_counter()
-        print(f"   -> {len(PROVINCE_CODES) - len(prov_skipped)}/{len(PROVINCE_CODES)} provinsi, {total_hosps[0]} RS [{t1-t0:.1f}s]. Menunggu detail...")
+        ok_provinces = len(PROVINCE_CODES) - len(skipped_provinces)
+        logger.info("%d/%d provinces OK, %d hospitals found [%.1fs]. Waiting for details...", ok_provinces, len(PROVINCE_CODES), total_hospitals, t1 - t0)
 
-        hosp_results = await asyncio.gather(*all_results)
+        # --- Phase 2: Collect hospital detail results ---
+        hospital_results = await asyncio.gather(*detail_tasks)
         t2 = time.perf_counter()
 
-        all_data = []
+        all_data: list[dict] = []
         empty_count = 0
-        failed_hosps = []
-        for hosp, data in hosp_results:
+        failed_hospitals: list[dict] = []
+
+        for hosp, data in hospital_results:
             if data is None:
-                failed_hosps.append(hosp)
+                failed_hospitals.append(hosp)
             elif data:
                 all_data.extend(data)
             else:
                 empty_count += 1
-        print(f"   Pass pertama: {total_hosps[0]-len(failed_hosps)} OK, {len(failed_hosps)} gagal [{t2-t1:.1f}s]")
 
-        for ronde in range(2, MAX_ROUNDS + 1):
-            if not failed_hosps:
+        logger.info("First pass: %d OK, %d failed [%.1fs]", total_hospitals - len(failed_hospitals), len(failed_hospitals), t2 - t1)
+
+        # --- Phase 3: Retry failed hospitals ---
+        for round_num in range(2, MAX_RETRY_ROUNDS + 1):
+            if not failed_hospitals:
                 break
             tr = time.perf_counter()
-            print(f"   Retry {len(failed_hosps)} RS (ronde {ronde})...")
-            await asyncio.sleep(0.5)
-            retry_results = await asyncio.gather(*[fetch_hosp(h) for h in failed_hosps])
-            still_failed = []
+            logger.info("Retrying %d hospitals (round %d)...", len(failed_hospitals), round_num)
+            await asyncio.sleep(RETRY_DELAY_HOSPITAL)
+
+            retry_results = await asyncio.gather(*[fetch_hospital_detail(h) for h in failed_hospitals])
+            still_failed: list[dict] = []
             for hosp, data in retry_results:
                 if data is None:
                     still_failed.append(hosp)
@@ -188,49 +250,95 @@ async def run():
                     all_data.extend(data)
                 else:
                     empty_count += 1
-            recovered = len(failed_hosps) - len(still_failed)
-            print(f"     +{recovered} recovered [{time.perf_counter()-tr:.1f}s]")
-            failed_hosps = still_failed
 
-        done = total_hosps[0] - len(failed_hosps)
-        print(f"   ... {done}/{total_hosps[0]} RS berhasil")
-        if failed_hosps:
-            print(f"   PERINGATAN: {len(failed_hosps)} RS gagal setelah {MAX_ROUNDS} ronde")
-            for h in failed_hosps[:10]:
-                print(f"     - {h['Hospital_Name']} ({h['kode_rs']})")
-            if len(failed_hosps) > 10:
-                print(f"     ... dan {len(failed_hosps) - 10} lainnya")
+            recovered = len(failed_hospitals) - len(still_failed)
+            logger.info("  +%d recovered [%.1fs]", recovered, time.perf_counter() - tr)
+            failed_hospitals = still_failed
+
+        done = total_hospitals - len(failed_hospitals)
+        logger.info("%d/%d hospitals completed", done, total_hospitals)
+
+        if failed_hospitals:
+            logger.warning("%d hospitals failed after %d rounds:", len(failed_hospitals), MAX_RETRY_ROUNDS)
+            for h in failed_hospitals[:10]:
+                logger.warning("  - %s (%s)", h["Hospital_Name"], h["kode_rs"])
+            if len(failed_hospitals) > 10:
+                logger.warning("  ... and %d more", len(failed_hospitals) - 10)
+
         if empty_count:
-            print(f"   ({empty_count} RS tidak memiliki data tempat tidur)")
+            logger.info("%d hospitals had no bed data", empty_count)
 
-    print(f" -> {len(all_data)} baris dari {total_hosps[0]} RS.\nMenyimpan ke CSV dan Load ke BigQuery...")
+    return all_data, total_hospitals
 
-    csv_future = asyncio.get_running_loop().run_in_executor(None, write_csv, all_data)
-    await csv_future
+# ---------------------------------------------------------------------------
+# Output: CSV
+# ---------------------------------------------------------------------------
+
+def write_csv(all_data: list[dict]) -> None:
+    """Write scraped data to CSV file."""
+    with open(CSV_OUTPUT, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDS)
+        writer.writeheader()
+        writer.writerows(all_data)
+    logger.info("CSV saved: %s (%d rows)", CSV_OUTPUT, len(all_data))
+
+# ---------------------------------------------------------------------------
+# Output: BigQuery
+# ---------------------------------------------------------------------------
+
+def upload_to_bigquery(all_data: list[dict], gcp_json_str: str) -> None:
+    """Load scraped data into BigQuery via append."""
+    gcp_info = json.loads(gcp_json_str)
+    credentials = service_account.Credentials.from_service_account_info(gcp_info)
+    client = bigquery.Client(credentials=credentials, project=credentials.project_id)
+
+    table_id = f"{credentials.project_id}.{BQ_DATASET}.{BQ_TABLE}"
+
+    job_config = bigquery.LoadJobConfig(
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        autodetect=True,
+        schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION],
+    )
+
+    bq_start = time.perf_counter()
+    job = client.load_table_from_json(all_data, table_id, job_config=job_config)
+    job.result()
+
+    logger.info("BigQuery load complete: %d rows -> %s [%.1fs]", job.output_rows, table_id, time.perf_counter() - bq_start)
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+async def run() -> int:
+    """Main orchestrator. Returns 0 on success, 1 on failure."""
+    gcp_json_str = os.environ.get("GCP_CREDENTIALS")
+    if not gcp_json_str:
+        logger.error("Environment variable GCP_CREDENTIALS is not set")
+        return 1
+
+    total_start = time.perf_counter()
+    sent_date = datetime.now(timezone(timedelta(hours=7))).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    all_data, total_hospitals = await scrape_all(sent_date)
+    logger.info("%d rows from %d hospitals", len(all_data), total_hospitals)
+
+    if not all_data:
+        logger.error("No data scraped — aborting")
+        return 1
+
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, write_csv, all_data)
 
     try:
-        gcp_info = json.loads(gcp_json_str)
-        credentials = service_account.Credentials.from_service_account_info(gcp_info)
-        client = bigquery.Client(credentials=credentials, project=credentials.project_id)
-        
-        table_id = f"{credentials.project_id}.siranap_db.bed_capacity"
-        
-        job_config = bigquery.LoadJobConfig(
-            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
-            autodetect=True, 
-            schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION]
-        )
-        
-        bq_start = time.perf_counter()
-        job = client.load_table_from_json(all_data, table_id, job_config=job_config)
-        job.result() 
-        
-        print(f"✅ BERHASIL: {job.output_rows} baris masuk ke tabel BigQuery {table_id}.")
-        print(f"   Waktu load BQ: {time.perf_counter() - bq_start:.1f}s")
+        upload_to_bigquery(all_data, gcp_json_str)
     except Exception as e:
-        print(f"❌ GAGAL load ke BigQuery: {e}")
+        logger.error("BigQuery upload failed: %s", e)
+        return 1
 
-    print(f"TOTAL RUNTIME: {time.perf_counter() - total_start:.1f}s")
+    logger.info("Total runtime: %.1fs", time.perf_counter() - total_start)
+    return 0
+
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    sys.exit(asyncio.run(run()))
