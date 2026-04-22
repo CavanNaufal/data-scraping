@@ -169,17 +169,19 @@ async def _fetch(
     timeout: int = REQUEST_TIMEOUT,
 ) -> object | None:
     """Fetch a URL with multiple retries and backoff. Returns response or None."""
+    last_error = None
     for attempt in range(MAX_FETCH_ATTEMPTS):
         async with sem:
             try:
                 resp = await session.get(url, headers=_HTTP_HEADERS, timeout=timeout)
                 if resp.status_code == 200:
                     return resp
-                logger.debug("HTTP %d for %s (attempt %d)", resp.status_code, url, attempt + 1)
+                last_error = f"HTTP {resp.status_code}"
             except Exception as e:
-                logger.debug("Fetch error for %s (attempt %d): %s", url, attempt + 1, e)
+                last_error = str(e)
         if attempt < MAX_FETCH_ATTEMPTS - 1:
             await asyncio.sleep(0.5 * (attempt + 1))
+    logger.warning("Failed after %d attempts: %s — %s", MAX_FETCH_ATTEMPTS, url, last_error)
     return None
 
 # ---------------------------------------------------------------------------
