@@ -33,6 +33,8 @@ RETRY_TIMEOUT = 30
 RETRY_CONCURRENCY = 20
 MAX_RETRY_ROUNDS = 5
 RETRY_DELAY = 3.0
+VERIFY_TIMEOUT = 60
+VERIFY_CONCURRENCY = 5
 
 BQ_DATASET = "siranap_db"
 BQ_TABLE = "bed_capacity"
@@ -288,19 +290,56 @@ async def scrape_all(sent_date: str) -> tuple[list[dict], int, list[dict]]:
             failed_hospitals = still_failed
 
         done = total_hospitals - len(failed_hospitals)
-        logger.info("%d/%d hospitals completed", done, total_hospitals)
+        logger.info("%d/%d hospitals completed after retries", done, total_hospitals)
 
+        # === Phase 4: Verify remaining failures one-by-one ===
+        # Distinguish "no bed data" from "truly unreachable"
+        truly_failed: list[dict] = []
         if failed_hospitals:
-            logger.error("%d hospitals failed:", len(failed_hospitals))
-            for h in failed_hospitals[:20]:
+            verify_sem = asyncio.Semaphore(VERIFY_CONCURRENCY)
+            logger.info("Verifying %d remaining hospitals one-by-one (timeout=%ds)...", len(failed_hospitals), VERIFY_TIMEOUT)
+            await asyncio.sleep(5)
+
+            async def verify_hospital(hosp: dict) -> tuple[dict, str, list]:
+                """Returns (hosp, status, data). Status: 'ok', 'no_data', or error description."""
+                url = HOSPITAL_URL.format(hosp["kode_rs"], hosp["prop_code"])
+                async with verify_sem:
+                    try:
+                        resp = await session.get(url, headers=_HTTP_HEADERS, timeout=VERIFY_TIMEOUT)
+                        if resp.status_code == 200:
+                            data = parse_hospital_detail(resp.text, hosp["Province"], hosp["Hospital_Name"], sent_date, hosp["kode_rs"])
+                            if data:
+                                return hosp, "ok", data
+                            return hosp, "no_data", []
+                        return hosp, f"http_{resp.status_code}", []
+                    except Exception as e:
+                        return hosp, f"error: {e}", []
+
+            verify_results = await asyncio.gather(*[verify_hospital(h) for h in failed_hospitals])
+
+            for hosp, status, data in verify_results:
+                if status == "ok":
+                    all_data.extend(data)
+                    logger.info("  Verified OK: %s (%s)", hosp["Hospital_Name"], hosp["kode_rs"])
+                elif status == "no_data":
+                    empty_count += 1
+                    logger.info("  No bed data: %s (%s) — skipping (normal)", hosp["Hospital_Name"], hosp["kode_rs"])
+                else:
+                    truly_failed.append(hosp)
+                    logger.warning("  Unreachable: %s (%s) — %s", hosp["Hospital_Name"], hosp["kode_rs"], status)
+
+        final_done = total_hospitals - len(truly_failed)
+        logger.info("Final: %d/%d hospitals completed", final_done, total_hospitals)
+
+        if truly_failed:
+            logger.error("%d hospitals truly unreachable:", len(truly_failed))
+            for h in truly_failed:
                 logger.error("  - %s (%s) [%s]", h["Hospital_Name"], h["kode_rs"], h["Province"])
-            if len(failed_hospitals) > 20:
-                logger.error("  ... and %d more", len(failed_hospitals) - 20)
 
         if empty_count:
-            logger.info("%d hospitals had no bed data", empty_count)
+            logger.info("%d hospitals had no bed data (normal)", empty_count)
 
-    return all_data, total_hospitals, failed_hospitals
+    return all_data, total_hospitals, truly_failed
 
 # ---------------------------------------------------------------------------
 # Output: CSV
