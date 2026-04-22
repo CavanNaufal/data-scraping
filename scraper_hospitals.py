@@ -399,8 +399,17 @@ def upload_to_bigquery(all_data: list[dict], gcp_json_str: str) -> None:
 
     job_config = bigquery.LoadJobConfig(
         write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
-        autodetect=True,
-        schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION],
+        schema=[
+            bigquery.SchemaField("Province", "STRING"),
+            bigquery.SchemaField("Kode_RS", "STRING"),
+            bigquery.SchemaField("Hospital_Name", "STRING"),
+            bigquery.SchemaField("Class", "STRING"),
+            bigquery.SchemaField("Total_Beds", "INTEGER"),
+            bigquery.SchemaField("Available_Beds", "INTEGER"),
+            bigquery.SchemaField("Occupied_Beds", "INTEGER"),
+            bigquery.SchemaField("BOR_Percentage", "FLOAT"),
+            bigquery.SchemaField("Sent_Date", "TIMESTAMP"),
+        ],
     )
 
     bq_start = time.perf_counter()
