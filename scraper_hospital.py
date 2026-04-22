@@ -189,6 +189,33 @@ def today_already_scraped(client: bigquery.Client, table_id: str, today_wib: str
         logger.warning("Could not check existing data: %s — proceeding with scrape", e)
         return False
 
+
+# Toleransi 5% — jika RS hari ini < 95% dari baseline, dianggap tidak lengkap
+BASELINE_TOLERANCE = 0.95
+
+def get_baseline_hospital_count(client: bigquery.Client, table_id: str) -> int | None:
+    """Get the number of unique hospitals from the most recent successful scrape."""
+    query = f"""
+        WITH latest AS (
+            SELECT DATE(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S%Ez', Sent_Date)) as scrape_date
+            FROM `{table_id}`
+            ORDER BY Sent_Date DESC
+            LIMIT 1
+        )
+        SELECT COUNT(DISTINCT Kode_RS) as hospital_count
+        FROM `{table_id}`
+        WHERE DATE(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S%Ez', Sent_Date)) = (SELECT scrape_date FROM latest)
+    """
+    try:
+        result = list(client.query(query).result())
+        count = result[0].hospital_count if result else None
+        if count:
+            logger.info("Baseline from last scrape: %d unique hospitals", count)
+        return count
+    except Exception as e:
+        logger.warning("Could not get baseline hospital count: %s", e)
+        return None
+
 # ---------------------------------------------------------------------------
 # Scraping orchestration
 # ---------------------------------------------------------------------------
@@ -401,8 +428,11 @@ async def run() -> int:
         if today_already_scraped(client, table_id, today_wib):
             logger.info("Data for %s already exists in BigQuery — skipping", today_wib)
             return 0
+
+        baseline = get_baseline_hospital_count(client, table_id)
     except Exception as e:
         logger.warning("Could not verify existing data: %s — proceeding with scrape", e)
+        baseline = None
 
     total_start = time.perf_counter()
     sent_date = datetime.now(wib_tz).strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -420,6 +450,18 @@ async def run() -> int:
     if not all_data:
         logger.error("No data scraped — aborting")
         return 1
+
+    # Validate against baseline: did we find enough hospitals?
+    if baseline:
+        min_expected = int(baseline * BASELINE_TOLERANCE)
+        if total_hospitals < min_expected:
+            logger.error(
+                "ABORTING: found only %d hospitals, expected at least %d (baseline=%d, tolerance=%.0f%%). "
+                "Province listing may be incomplete.",
+                total_hospitals, min_expected, baseline, BASELINE_TOLERANCE * 100,
+            )
+            return 1
+        logger.info("Hospital count check passed: %d found (baseline=%d, min=%d)", total_hospitals, baseline, min_expected)
 
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, write_csv, all_data)
