@@ -1,16 +1,19 @@
 name: Automated Siranap Scraper
 
 on:
-   #schedule:
-    # - cron: '0 * * * *'
+  schedule:
+    # Jam 8 WIB, 12 WIB, 16 WIB (= 01, 05, 09 UTC)
+    # Script cek BigQuery dulu — kalau hari ini sudah ada data, langsung skip
+    - cron: '0 1 * * *'
+    - cron: '0 5 * * *'
+    - cron: '0 9 * * *'
   workflow_dispatch:
 
 permissions:
   contents: write
 
 env:
-  # Anda bisa membiarkan atau menghapus FORCE_JAVASCRIPT ini, tidak masalah
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true 
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   UV_CACHE_DIR: /tmp/uv-cache
 
 jobs:
@@ -26,17 +29,50 @@ jobs:
           enable-cache: true
           cache-dependency-glob: "requirements*.txt"
 
-      - name: Install & Run Scraper
-        env:
-          # --- INI YANG BERUBAH ---
-          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+      - name: Install Dependencies
         run: |
           uv venv .venv
           source .venv/bin/activate
           uv pip install -r requirements.txt
-          python -u scraper_hospital.py
+
+      - name: Run Scraper (attempt 1)
+        id: attempt1
+        continue-on-error: true
+        env:
+          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+        run: |
+          source .venv/bin/activate
+          python -u scraper_hospitals.py
+
+      - name: Wait before retry
+        if: steps.attempt1.outcome == 'failure'
+        run: sleep 180
+
+      - name: Run Scraper (attempt 2)
+        id: attempt2
+        if: steps.attempt1.outcome == 'failure'
+        continue-on-error: true
+        env:
+          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+        run: |
+          source .venv/bin/activate
+          python -u scraper_hospitals.py
+
+      - name: Wait before retry
+        if: steps.attempt2.outcome == 'failure'
+        run: sleep 300
+
+      - name: Run Scraper (attempt 3)
+        id: attempt3
+        if: steps.attempt2.outcome == 'failure'
+        env:
+          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+        run: |
+          source .venv/bin/activate
+          python -u scraper_hospitals.py
 
       - name: Save CSV Backup to GitHub
+        if: steps.attempt1.outcome == 'success' || steps.attempt2.outcome == 'success' || steps.attempt3.outcome == 'success'
         run: |
           git config --global user.name "GitHub Action Bot"
           git config --global user.email "action@github.com"
