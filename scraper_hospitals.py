@@ -179,7 +179,7 @@ def today_already_scraped(client: bigquery.Client, table_id: str, today_wib: str
     query = f"""
         SELECT COUNT(*) as cnt
         FROM `{table_id}`
-        WHERE DATE(Sent_Date, 'Asia/Jakarta') = '{today_wib}'
+        WHERE DATE(Sent_Date) = '{today_wib}'
     """
     try:
         result = list(client.query(query).result())
@@ -194,23 +194,30 @@ def today_already_scraped(client: bigquery.Client, table_id: str, today_wib: str
 BASELINE_TOLERANCE = 0.95
 
 def get_baseline_hospital_count(client: bigquery.Client, table_id: str) -> int | None:
-    """Get the number of unique hospitals from the most recent successful scrape."""
+    """Get the number of unique hospitals from the most recent scrape that has Kode_RS."""
     query = f"""
         WITH latest AS (
-            SELECT DATE(Sent_Date, 'Asia/Jakarta') as scrape_date
+            SELECT DATE(Sent_Date) as scrape_date
             FROM `{table_id}`
+            WHERE Kode_RS IS NOT NULL
             ORDER BY Sent_Date DESC
             LIMIT 1
         )
-        SELECT COUNT(DISTINCT Hospital_Name) as hospital_count
+        SELECT
+            (SELECT scrape_date FROM latest) as scrape_date,
+            COUNT(DISTINCT Kode_RS) as hospital_count
         FROM `{table_id}`
-        WHERE DATE(Sent_Date, 'Asia/Jakarta') = (SELECT scrape_date FROM latest)
+        WHERE DATE(Sent_Date) = (SELECT scrape_date FROM latest)
+          AND Kode_RS IS NOT NULL
     """
     try:
         result = list(client.query(query).result())
-        count = result[0].hospital_count if result else None
-        if count:
-            logger.info("Baseline from last scrape: %d unique hospitals", count)
+        if not result or not result[0].hospital_count:
+            logger.info("No baseline with Kode_RS found — skipping baseline check")
+            return None
+        count = result[0].hospital_count
+        scrape_date = result[0].scrape_date
+        logger.info("Baseline from %s: %d unique hospitals (by Kode_RS)", scrape_date, count)
         return count
     except Exception as e:
         logger.warning("Could not get baseline hospital count: %s", e)
