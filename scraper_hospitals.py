@@ -202,7 +202,7 @@ def get_baseline_hospital_count(client: bigquery.Client, table_id: str) -> int |
             ORDER BY Sent_Date DESC
             LIMIT 1
         )
-        SELECT COUNT(DISTINCT Kode_RS) as hospital_count
+        SELECT COUNT(DISTINCT Hospital_Name) as hospital_count
         FROM `{table_id}`
         WHERE DATE(Sent_Date, 'Asia/Jakarta') = (SELECT scrape_date FROM latest)
     """
