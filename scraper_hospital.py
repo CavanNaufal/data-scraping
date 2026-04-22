@@ -26,14 +26,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-CONCURRENCY_LIMIT = 30
-MAX_HTTP_CLIENTS = 50
-REQUEST_TIMEOUT = 20
-RETRY_REQUEST_TIMEOUT = 30
-MAX_FETCH_ATTEMPTS = 3
-MAX_RETRY_ROUNDS = 10
-BACKOFF_CAP = 10.0
-PROVINCE_BATCH_SIZE = 10
+CONCURRENCY_LIMIT = 100
+MAX_HTTP_CLIENTS = 120
+REQUEST_TIMEOUT = 15
+RETRY_TIMEOUT = 30
+RETRY_CONCURRENCY = 20
+MAX_RETRY_ROUNDS = 5
+RETRY_DELAY = 3.0
 
 BQ_DATASET = "siranap_db"
 BQ_TABLE = "bed_capacity"
@@ -72,18 +71,6 @@ _HTTP_HEADERS = {
 }
 
 _NUMBER_RE = re.compile(r"\d+")
-
-
-def _backoff_delay(round_num: int) -> float:
-    """Exponential backoff: 1s, 2s, 4s, ... capped at BACKOFF_CAP."""
-    return min(2 ** (round_num - 2), BACKOFF_CAP)
-
-
-def _retry_concurrency(round_num: int) -> int:
-    """Lower concurrency on later retry rounds to reduce server load."""
-    if round_num <= 3:
-        return 20
-    return 10
 
 # ---------------------------------------------------------------------------
 # HTML Parsing
@@ -168,21 +155,37 @@ async def _fetch(
     url: str,
     timeout: int = REQUEST_TIMEOUT,
 ) -> object | None:
-    """Fetch a URL with multiple retries and backoff. Returns response or None."""
-    last_error = None
-    for attempt in range(MAX_FETCH_ATTEMPTS):
+    """Fetch a URL with one retry. Returns response or None."""
+    for attempt in range(2):
         async with sem:
             try:
                 resp = await session.get(url, headers=_HTTP_HEADERS, timeout=timeout)
                 if resp.status_code == 200:
                     return resp
-                last_error = f"HTTP {resp.status_code}"
-            except Exception as e:
-                last_error = str(e)
-        if attempt < MAX_FETCH_ATTEMPTS - 1:
-            await asyncio.sleep(0.5 * (attempt + 1))
-    logger.warning("Failed after %d attempts: %s — %s", MAX_FETCH_ATTEMPTS, url, last_error)
+            except Exception:
+                pass
+        if attempt == 0:
+            await asyncio.sleep(0.3)
     return None
+
+# ---------------------------------------------------------------------------
+# BigQuery: check if today already has data
+# ---------------------------------------------------------------------------
+
+def today_already_scraped(client: bigquery.Client, table_id: str, today_wib: str) -> bool:
+    """Check if data for today (WIB date) already exists in BigQuery."""
+    query = f"""
+        SELECT COUNT(*) as cnt
+        FROM `{table_id}`
+        WHERE DATE(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S%Ez', Sent_Date)) = '{today_wib}'
+    """
+    try:
+        result = list(client.query(query).result())
+        count = result[0].cnt if result else 0
+        return count > 0
+    except Exception as e:
+        logger.warning("Could not check existing data: %s — proceeding with scrape", e)
+        return False
 
 # ---------------------------------------------------------------------------
 # Scraping orchestration
@@ -194,7 +197,7 @@ async def scrape_all(sent_date: str) -> tuple[list[dict], int, list[dict]]:
     Returns (rows, total_hospital_count, failed_hospitals).
     """
     sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
-    detail_tasks: list[asyncio.Task] = []
+    all_results: list[asyncio.Task] = []
     total_hospitals = 0
 
     async with AsyncSession(impersonate="chrome120", max_clients=MAX_HTTP_CLIENTS) as session:
@@ -210,75 +213,40 @@ async def scrape_all(sent_date: str) -> tuple[list[dict], int, list[dict]]:
                 return hosp, None
             return hosp, parse_hospital_detail(resp.text, hosp["Province"], hosp["Hospital_Name"], sent_date, hosp["kode_rs"])
 
-        async def fetch_province(
-            code: int,
-            use_sem: asyncio.Semaphore | None = None,
-            timeout: int = REQUEST_TIMEOUT,
-        ) -> tuple[int, list | None]:
-            s = use_sem or sem
-            resp = await _fetch(session, s, PROVINCE_URL.format(code), timeout=timeout)
+        async def fetch_province(code: int) -> tuple[int, list | None]:
+            resp = await _fetch(session, sem, PROVINCE_URL.format(code))
             if not resp:
                 return code, None
             hospitals = extract_hospital_codes(resp.text, str(code))
             nonlocal total_hospitals
             total_hospitals += len(hospitals)
             for h in hospitals:
-                detail_tasks.append(asyncio.create_task(fetch_hospital_detail(h)))
+                all_results.append(asyncio.create_task(fetch_hospital_detail(h)))
             return code, hospitals
 
-        # === Phase 1: Fetch province listings in batches with retries ===
         t0 = time.perf_counter()
-        logger.info("Scraping province listings in batches of %d...", PROVINCE_BATCH_SIZE)
+        logger.info("Scraping provinces + hospital details (concurrency=%d)...", CONCURRENCY_LIMIT)
 
-        remaining_provinces = list(PROVINCE_CODES)
-
-        # First pass: batch provinces to avoid overwhelming the server
-        first_pass_failed: list[int] = []
-        for i in range(0, len(remaining_provinces), PROVINCE_BATCH_SIZE):
-            batch = remaining_provinces[i:i + PROVINCE_BATCH_SIZE]
-            results = await asyncio.gather(*[fetch_province(c) for c in batch])
-            first_pass_failed.extend(code for code, hosps in results if hosps is None)
-            if i + PROVINCE_BATCH_SIZE < len(remaining_provinces):
-                await asyncio.sleep(0.5)
-
-        remaining_provinces = first_pass_failed
-        if remaining_provinces:
-            logger.info("First pass: %d provinces failed, starting retries...", len(remaining_provinces))
-
-        # Retry rounds with backoff
-        for round_num in range(2, MAX_RETRY_ROUNDS + 1):
-            if not remaining_provinces:
+        # Fetch all provinces at once (fast-fail approach)
+        prov_remaining = list(PROVINCE_CODES)
+        for round_num in range(1, MAX_RETRY_ROUNDS + 1):
+            if not prov_remaining:
                 break
-            delay = _backoff_delay(round_num)
-            concurrency = _retry_concurrency(round_num)
-            retry_sem = asyncio.Semaphore(concurrency)
-            logger.info(
-                "Retrying %d provinces (round %d, delay %.0fs, concurrency %d)...",
-                len(remaining_provinces), round_num, delay, concurrency,
-            )
-            await asyncio.sleep(delay)
-            results = await asyncio.gather(*[
-                fetch_province(c, use_sem=retry_sem, timeout=RETRY_REQUEST_TIMEOUT)
-                for c in remaining_provinces
-            ])
-            remaining_provinces = [code for code, hosps in results if hosps is None]
+            if round_num > 1:
+                logger.info("Retrying %d provinces (round %d)...", len(prov_remaining), round_num)
+                await asyncio.sleep(RETRY_DELAY)
+            results = await asyncio.gather(*[fetch_province(c) for c in prov_remaining])
+            prov_remaining = [code for code, hosps in results if hosps is None]
 
-        skipped_provinces = remaining_provinces
-        if skipped_provinces:
-            logger.warning(
-                "%d provinces returned no data (may not have hospitals): %s",
-                len(skipped_provinces), skipped_provinces,
-            )
+        if prov_remaining:
+            logger.warning("%d provinces returned no data: %s", len(prov_remaining), prov_remaining)
 
         t1 = time.perf_counter()
-        ok_provinces = len(PROVINCE_CODES) - len(skipped_provinces)
-        logger.info(
-            "%d/%d provinces OK, %d hospitals found [%.1fs]. Waiting for details...",
-            ok_provinces, len(PROVINCE_CODES), total_hospitals, t1 - t0,
-        )
+        ok_prov = len(PROVINCE_CODES) - len(prov_remaining)
+        logger.info("%d/%d provinces, %d hospitals [%.1fs]. Waiting for details...", ok_prov, len(PROVINCE_CODES), total_hospitals, t1 - t0)
 
-        # === Phase 2: Collect hospital detail results ===
-        hospital_results = await asyncio.gather(*detail_tasks)
+        # Collect hospital results
+        hospital_results = await asyncio.gather(*all_results)
         t2 = time.perf_counter()
 
         all_data: list[dict] = []
@@ -293,32 +261,20 @@ async def scrape_all(sent_date: str) -> tuple[list[dict], int, list[dict]]:
             else:
                 empty_count += 1
 
-        logger.info(
-            "First pass: %d OK, %d failed [%.1fs]",
-            total_hospitals - len(failed_hospitals), len(failed_hospitals), t2 - t1,
-        )
+        logger.info("First pass: %d OK, %d failed [%.1fs]", total_hospitals - len(failed_hospitals), len(failed_hospitals), t2 - t1)
 
-        # === Phase 3: Retry failed hospitals with backoff ===
+        # Retry failed hospitals with lower concurrency and longer timeout
+        retry_sem = asyncio.Semaphore(RETRY_CONCURRENCY)
         for round_num in range(2, MAX_RETRY_ROUNDS + 1):
             if not failed_hospitals:
                 break
-
-            delay = _backoff_delay(round_num)
-            concurrency = _retry_concurrency(round_num)
-            retry_sem = asyncio.Semaphore(concurrency)
-
-            logger.info(
-                "Retrying %d hospitals (round %d, delay %.0fs, concurrency %d)...",
-                len(failed_hospitals), round_num, delay, concurrency,
-            )
-            await asyncio.sleep(delay)
-
+            logger.info("Retrying %d hospitals (round %d, concurrency=%d, timeout=%ds)...", len(failed_hospitals), round_num, RETRY_CONCURRENCY, RETRY_TIMEOUT)
+            await asyncio.sleep(RETRY_DELAY)
             tr = time.perf_counter()
             retry_results = await asyncio.gather(*[
-                fetch_hospital_detail(h, use_sem=retry_sem, timeout=RETRY_REQUEST_TIMEOUT)
+                fetch_hospital_detail(h, use_sem=retry_sem, timeout=RETRY_TIMEOUT)
                 for h in failed_hospitals
             ])
-
             still_failed: list[dict] = []
             for hosp, data in retry_results:
                 if data is None:
@@ -327,7 +283,6 @@ async def scrape_all(sent_date: str) -> tuple[list[dict], int, list[dict]]:
                     all_data.extend(data)
                 else:
                     empty_count += 1
-
             recovered = len(failed_hospitals) - len(still_failed)
             logger.info("  +%d recovered [%.1fs]", recovered, time.perf_counter() - tr)
             failed_hospitals = still_failed
@@ -336,9 +291,11 @@ async def scrape_all(sent_date: str) -> tuple[list[dict], int, list[dict]]:
         logger.info("%d/%d hospitals completed", done, total_hospitals)
 
         if failed_hospitals:
-            logger.error("%d hospitals STILL FAILED after %d rounds:", len(failed_hospitals), MAX_RETRY_ROUNDS)
-            for h in failed_hospitals:
-                logger.error("  - %s (%s) [province: %s]", h["Hospital_Name"], h["kode_rs"], h["Province"])
+            logger.error("%d hospitals failed:", len(failed_hospitals))
+            for h in failed_hospitals[:20]:
+                logger.error("  - %s (%s) [%s]", h["Hospital_Name"], h["kode_rs"], h["Province"])
+            if len(failed_hospitals) > 20:
+                logger.error("  ... and %d more", len(failed_hospitals) - 20)
 
         if empty_count:
             logger.info("%d hospitals had no bed data", empty_count)
@@ -392,16 +349,32 @@ async def run() -> int:
         logger.error("Environment variable GCP_CREDENTIALS is not set")
         return 1
 
+    # Check if today's data already exists in BigQuery
+    wib_tz = timezone(timedelta(hours=7))
+    today_wib = datetime.now(wib_tz).strftime("%Y-%m-%d")
+
+    try:
+        gcp_info = json.loads(gcp_json_str)
+        credentials = service_account.Credentials.from_service_account_info(gcp_info)
+        client = bigquery.Client(credentials=credentials, project=credentials.project_id)
+        table_id = f"{credentials.project_id}.{BQ_DATASET}.{BQ_TABLE}"
+
+        if today_already_scraped(client, table_id, today_wib):
+            logger.info("Data for %s already exists in BigQuery — skipping", today_wib)
+            return 0
+    except Exception as e:
+        logger.warning("Could not verify existing data: %s — proceeding with scrape", e)
+
     total_start = time.perf_counter()
-    sent_date = datetime.now(timezone(timedelta(hours=7))).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    sent_date = datetime.now(wib_tz).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
     all_data, total_hospitals, failed_hospitals = await scrape_all(sent_date)
     logger.info("%d rows from %d hospitals", len(all_data), total_hospitals)
 
     if failed_hospitals:
         logger.error(
-            "ABORTING: %d/%d hospitals could not be scraped after %d retry rounds — data incomplete",
-            len(failed_hospitals), total_hospitals, MAX_RETRY_ROUNDS,
+            "FAILED: %d/%d hospitals could not be scraped — data incomplete, aborting",
+            len(failed_hospitals), total_hospitals,
         )
         return 1
 
