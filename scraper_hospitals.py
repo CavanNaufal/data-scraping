@@ -179,7 +179,7 @@ def today_already_scraped(client: bigquery.Client, table_id: str, today_wib: str
     query = f"""
         SELECT COUNT(*) as cnt
         FROM `{table_id}`
-        WHERE DATE(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S%Ez', Sent_Date)) = '{today_wib}'
+        WHERE DATE(Sent_Date, 'Asia/Jakarta') = '{today_wib}'
     """
     try:
         result = list(client.query(query).result())
@@ -197,14 +197,14 @@ def get_baseline_hospital_count(client: bigquery.Client, table_id: str) -> int |
     """Get the number of unique hospitals from the most recent successful scrape."""
     query = f"""
         WITH latest AS (
-            SELECT DATE(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S%Ez', Sent_Date)) as scrape_date
+            SELECT DATE(Sent_Date, 'Asia/Jakarta') as scrape_date
             FROM `{table_id}`
             ORDER BY Sent_Date DESC
             LIMIT 1
         )
         SELECT COUNT(DISTINCT Kode_RS) as hospital_count
         FROM `{table_id}`
-        WHERE DATE(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S%Ez', Sent_Date)) = (SELECT scrape_date FROM latest)
+        WHERE DATE(Sent_Date, 'Asia/Jakarta') = (SELECT scrape_date FROM latest)
     """
     try:
         result = list(client.query(query).result())
