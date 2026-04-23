@@ -4,10 +4,10 @@ on:
   schedule:
     # Jam 8 WIB, 12 WIB, 16 WIB (= 01, 05, 09 UTC)
     # Script cek BigQuery dulu — kalau hari ini sudah ada data, langsung skip
-    - cron: '0 1 * * *'
-    - cron: '0 5 * * *'
-    - cron: '0 9 * * *'
+    - cron: '0 11 * * *'
     - cron: '0 13 * * *'
+    - cron: '0 15 * * *'
+    #- cron: '0 16 * * *'
   workflow_dispatch:
 
 permissions:
