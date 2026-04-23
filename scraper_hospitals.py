@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 from curl_cffi.requests import AsyncSession
@@ -31,10 +32,10 @@ MAX_HTTP_CLIENTS = 120
 REQUEST_TIMEOUT = 15
 RETRY_TIMEOUT = 30
 RETRY_CONCURRENCY = 20
-MAX_RETRY_ROUNDS = 5
-RETRY_DELAY = 3.0
-VERIFY_TIMEOUT = 60
-VERIFY_CONCURRENCY = 5
+MAX_RETRY_ROUNDS = 3
+RETRY_DELAY = 1.5
+VERIFY_TIMEOUT = 30
+VERIFY_CONCURRENCY = 15
 
 BQ_DATASET = "siranap_db"
 BQ_TABLE = "bed_capacity"
@@ -167,7 +168,7 @@ async def _fetch(
             except Exception:
                 pass
         if attempt == 0:
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.15)
     return None
 
 # ---------------------------------------------------------------------------
@@ -190,33 +191,39 @@ def today_already_scraped(client: bigquery.Client, table_id: str, today_wib: str
         return False
 
 
-# Toleransi 5% — jika RS hari ini < 95% dari baseline, dianggap tidak lengkap
-BASELINE_TOLERANCE = 0.95
+# Toleransi 10% — jika RS hari ini < 90% dari baseline, dianggap tidak lengkap
+BASELINE_TOLERANCE = 0.90
 
 def get_baseline_hospital_count(client: bigquery.Client, table_id: str) -> int | None:
-    """Get the number of unique hospitals from the most recent scrape."""
+    """Get average unique hospital count from the last 3 scrapes for a stable baseline."""
     query = f"""
-        WITH latest AS (
-            SELECT DATE(Sent_Date) as scrape_date
+        WITH daily AS (
+            SELECT
+                DATE(Sent_Date) as scrape_date,
+                COUNT(DISTINCT CONCAT(Province, '||', Hospital_Name)) as hospital_count
             FROM `{table_id}`
-            ORDER BY Sent_Date DESC
-            LIMIT 1
+            GROUP BY scrape_date
+            ORDER BY scrape_date DESC
+            LIMIT 3
         )
         SELECT
-            (SELECT scrape_date FROM latest) as scrape_date,
-            COUNT(DISTINCT CONCAT(Province, '||', Hospital_Name)) as hospital_count
-        FROM `{table_id}`
-        WHERE DATE(Sent_Date) = (SELECT scrape_date FROM latest)
+            CAST(AVG(hospital_count) AS INT64) as avg_count,
+            MIN(hospital_count) as min_count,
+            MAX(hospital_count) as max_count,
+            COUNT(*) as num_days
+        FROM daily
     """
     try:
         result = list(client.query(query).result())
-        if not result or not result[0].hospital_count:
+        if not result or not result[0].avg_count:
             logger.info("No baseline found — skipping baseline check")
             return None
-        count = result[0].hospital_count
-        scrape_date = result[0].scrape_date
-        logger.info("Baseline from %s: %d unique hospitals", scrape_date, count)
-        return count
+        row = result[0]
+        logger.info(
+            "Baseline from last %d scrapes: avg=%d, min=%d, max=%d",
+            row.num_days, row.avg_count, row.min_count, row.max_count,
+        )
+        return row.avg_count
     except Exception as e:
         logger.warning("Could not get baseline hospital count: %s", e)
         return None
@@ -330,7 +337,7 @@ async def scrape_all(sent_date: str) -> tuple[list[dict], int, list[dict]]:
         if failed_hospitals:
             verify_sem = asyncio.Semaphore(VERIFY_CONCURRENCY)
             logger.info("Verifying %d remaining hospitals one-by-one (timeout=%ds)...", len(failed_hospitals), VERIFY_TIMEOUT)
-            await asyncio.sleep(5)
+            await asyncio.sleep(2)
 
             async def verify_hospital(hosp: dict) -> tuple[dict, str, list]:
                 """Returns (hosp, status, data). Status: 'ok', 'no_data', or error description."""
@@ -439,11 +446,15 @@ async def run() -> int:
         client = bigquery.Client(credentials=credentials, project=credentials.project_id)
         table_id = f"{credentials.project_id}.{BQ_DATASET}.{BQ_TABLE}"
 
-        if today_already_scraped(client, table_id, today_wib):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut_today = pool.submit(today_already_scraped, client, table_id, today_wib)
+            fut_baseline = pool.submit(get_baseline_hospital_count, client, table_id)
+            already_scraped = fut_today.result()
+            baseline = fut_baseline.result()
+
+        if already_scraped:
             logger.info("Data for %s already exists in BigQuery — skipping", today_wib)
             return 0
-
-        baseline = get_baseline_hospital_count(client, table_id)
     except Exception as e:
         logger.warning("Could not verify existing data: %s — proceeding with scrape", e)
         baseline = None
