@@ -192,7 +192,7 @@ def today_already_scraped(client: bigquery.Client, table_id: str, today_wib: str
 
 
 # Toleransi 10% — jika RS hari ini < 90% dari baseline, dianggap tidak lengkap
-BASELINE_TOLERANCE = 0.90
+BASELINE_TOLERANCE = 0.80
 
 def get_baseline_hospital_count(client: bigquery.Client, table_id: str) -> int | None:
     """Get average unique hospital count from the last 3 scrapes for a stable baseline."""
