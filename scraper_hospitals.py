@@ -6,7 +6,6 @@ import os
 import re
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 from curl_cffi.requests import AsyncSession
@@ -175,58 +174,32 @@ async def _fetch(
 # BigQuery: check if today already has data
 # ---------------------------------------------------------------------------
 
-def today_already_scraped(client: bigquery.Client, table_id: str, today_wib: str) -> bool:
-    """Check if data for today (WIB date) already exists in BigQuery."""
+def get_today_hospital_count(client: bigquery.Client, table_id: str, today_wib: str) -> int:
+    """Get the number of unique hospitals already stored for today in BigQuery."""
     query = f"""
-        SELECT COUNT(*) as cnt
+        SELECT COUNT(DISTINCT CONCAT(Province, '||', Hospital_Name)) as hospital_count
         FROM `{table_id}`
         WHERE DATE(Sent_Date) = '{today_wib}'
     """
     try:
         result = list(client.query(query).result())
-        count = result[0].cnt if result else 0
-        return count > 0
+        count = result[0].hospital_count if result else 0
+        logger.info("Existing data for %s: %d hospitals in BigQuery", today_wib, count)
+        return count
     except Exception as e:
         logger.warning("Could not check existing data: %s — proceeding with scrape", e)
-        return False
+        return 0
 
 
-# Toleransi 10% — jika RS hari ini < 90% dari baseline, dianggap tidak lengkap
-BASELINE_TOLERANCE = 0.80
-
-def get_baseline_hospital_count(client: bigquery.Client, table_id: str) -> int | None:
-    """Get average unique hospital count from the last 3 scrapes for a stable baseline."""
+def delete_today_data(client: bigquery.Client, table_id: str, today_wib: str) -> None:
+    """Delete all rows for today's date from BigQuery."""
     query = f"""
-        WITH daily AS (
-            SELECT
-                DATE(Sent_Date) as scrape_date,
-                COUNT(DISTINCT CONCAT(Province, '||', Hospital_Name)) as hospital_count
-            FROM `{table_id}`
-            GROUP BY scrape_date
-            ORDER BY scrape_date DESC
-            LIMIT 3
-        )
-        SELECT
-            CAST(AVG(hospital_count) AS INT64) as avg_count,
-            MIN(hospital_count) as min_count,
-            MAX(hospital_count) as max_count,
-            COUNT(*) as num_days
-        FROM daily
+        DELETE FROM `{table_id}`
+        WHERE DATE(Sent_Date) = '{today_wib}'
     """
-    try:
-        result = list(client.query(query).result())
-        if not result or not result[0].avg_count:
-            logger.info("No baseline found — skipping baseline check")
-            return None
-        row = result[0]
-        logger.info(
-            "Baseline from last %d scrapes: avg=%d, min=%d, max=%d",
-            row.num_days, row.avg_count, row.min_count, row.max_count,
-        )
-        return row.avg_count
-    except Exception as e:
-        logger.warning("Could not get baseline hospital count: %s", e)
-        return None
+    job = client.query(query)
+    job.result()
+    logger.info("Deleted existing data for %s from BigQuery", today_wib)
 
 # ---------------------------------------------------------------------------
 # Scraping orchestration
@@ -446,18 +419,10 @@ async def run() -> int:
         client = bigquery.Client(credentials=credentials, project=credentials.project_id)
         table_id = f"{credentials.project_id}.{BQ_DATASET}.{BQ_TABLE}"
 
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            fut_today = pool.submit(today_already_scraped, client, table_id, today_wib)
-            fut_baseline = pool.submit(get_baseline_hospital_count, client, table_id)
-            already_scraped = fut_today.result()
-            baseline = fut_baseline.result()
-
-        if already_scraped:
-            logger.info("Data for %s already exists in BigQuery — skipping", today_wib)
-            return 0
+        existing_hospital_count = get_today_hospital_count(client, table_id, today_wib)
     except Exception as e:
         logger.warning("Could not verify existing data: %s — proceeding with scrape", e)
-        baseline = None
+        existing_hospital_count = 0
 
     total_start = time.perf_counter()
     sent_date = datetime.now(wib_tz).strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -466,32 +431,34 @@ async def run() -> int:
     logger.info("%d rows from %d hospitals", len(all_data), total_hospitals)
 
     if failed_hospitals:
-        logger.error(
-            "FAILED: %d/%d hospitals could not be scraped — data incomplete, aborting",
+        logger.warning(
+            "%d/%d hospitals could not be scraped — continuing with partial data",
             len(failed_hospitals), total_hospitals,
         )
-        return 1
 
     if not all_data:
         logger.error("No data scraped — aborting")
         return 1
 
-    # Validate against baseline: did we find enough hospitals?
-    if baseline:
-        min_expected = int(baseline * BASELINE_TOLERANCE)
-        if total_hospitals < min_expected:
-            logger.error(
-                "ABORTING: found only %d hospitals, expected at least %d (baseline=%d, tolerance=%.0f%%). "
-                "Province listing may be incomplete.",
-                total_hospitals, min_expected, baseline, BASELINE_TOLERANCE * 100,
-            )
-            return 1
-        logger.info("Hospital count check passed: %d found (baseline=%d, min=%d)", total_hospitals, baseline, min_expected)
+    # Compare with existing data: only upload if we have more hospitals
+    if total_hospitals <= existing_hospital_count:
+        logger.info(
+            "Scrape got %d hospitals, existing data has %d — keeping existing data (skip upload)",
+            total_hospitals, existing_hospital_count,
+        )
+        return 0
+
+    logger.info(
+        "Scrape got %d hospitals, existing data has %d — replacing with better data",
+        total_hospitals, existing_hospital_count,
+    )
 
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, write_csv, all_data)
 
     try:
+        if existing_hospital_count > 0:
+            delete_today_data(client, table_id, today_wib)
         upload_to_bigquery(all_data, gcp_json_str)
     except Exception as e:
         logger.error("BigQuery upload failed: %s", e)
