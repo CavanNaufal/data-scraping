@@ -191,15 +191,16 @@ def get_today_hospital_count(client: bigquery.Client, table_id: str, today_wib: 
         return 0
 
 
-def delete_today_data(client: bigquery.Client, table_id: str, today_wib: str) -> None:
-    """Delete all rows for today's date from BigQuery."""
+def replace_today_data(client: bigquery.Client, table_id: str, today_wib: str) -> None:
+    """Remove today's data using CREATE OR REPLACE TABLE (DDL, works on free tier)."""
     query = f"""
-        DELETE FROM `{table_id}`
-        WHERE DATE(Sent_Date) = '{today_wib}'
+        CREATE OR REPLACE TABLE `{table_id}` AS
+        SELECT * FROM `{table_id}`
+        WHERE DATE(Sent_Date) != '{today_wib}'
     """
     job = client.query(query)
     job.result()
-    logger.info("Deleted existing data for %s from BigQuery", today_wib)
+    logger.info("Removed existing data for %s from BigQuery (DDL)", today_wib)
 
 # ---------------------------------------------------------------------------
 # Scraping orchestration
@@ -440,7 +441,6 @@ async def run() -> int:
         logger.error("No data scraped — aborting")
         return 1
 
-    # Compare with existing data: only upload if we have more hospitals
     if total_hospitals <= existing_hospital_count:
         logger.info(
             "Scrape got %d hospitals, existing data has %d — keeping existing data (skip upload)",
@@ -458,7 +458,7 @@ async def run() -> int:
 
     try:
         if existing_hospital_count > 0:
-            delete_today_data(client, table_id, today_wib)
+            replace_today_data(client, table_id, today_wib)
         upload_to_bigquery(all_data, gcp_json_str)
     except Exception as e:
         logger.error("BigQuery upload failed: %s", e)
