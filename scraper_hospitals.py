@@ -441,16 +441,18 @@ async def run() -> int:
         logger.error("No data scraped — aborting")
         return 1
 
-    if total_hospitals <= existing_hospital_count:
+    scraped_hospital_count = len({(r["Province"], r["Hospital_Name"]) for r in all_data})
+
+    if scraped_hospital_count <= existing_hospital_count:
         logger.info(
-            "Scrape got %d hospitals, existing data has %d — keeping existing data (skip upload)",
-            total_hospitals, existing_hospital_count,
+            "Scrape got %d hospitals with data, existing data has %d — keeping existing data (skip upload)",
+            scraped_hospital_count, existing_hospital_count,
         )
         return 0
 
     logger.info(
-        "Scrape got %d hospitals, existing data has %d — replacing with better data",
-        total_hospitals, existing_hospital_count,
+        "Scrape got %d hospitals with data, existing data has %d — replacing with better data",
+        scraped_hospital_count, existing_hospital_count,
     )
 
     loop = asyncio.get_running_loop()
